@@ -161,9 +161,9 @@ func parseDecision(raw any) (Decision, error) {
 		return Decision{}, fmt.Errorf("ratelimit/redis: unexpected script return: %T", raw)
 	}
 
-	verdict, ok := arr[0].(int64)
+	verdict, ok := luaInt(arr[0])
 	if !ok {
-		return Decision{}, fmt.Errorf("ratelimit/redis: verdict not int64: %T", arr[0])
+		return Decision{}, fmt.Errorf("ratelimit/redis: verdict not numeric: %T", arr[0])
 	}
 
 	if verdict == 1 {
@@ -177,23 +177,8 @@ func parseDecision(raw any) (Decision, error) {
 		return Decision{Allow: false}, nil
 	}
 
-	// go-redis may surface Lua numeric returns as int64, float64, or even
-	// a stringified number depending on connection setup and Redis
-	// version. All three paths are tolerated; an unparseable value
-	// degrades to "no hint" rather than failing the deny.
-	var secs int64
-	switch v := arr[2].(type) {
-	case int64:
-		secs = v
-	case float64:
-		secs = int64(v)
-	case string:
-		parsed, err := strconv.ParseInt(v, 10, 64)
-		if err != nil {
-			return Decision{Allow: false}, nil
-		}
-		secs = parsed
-	default:
+	secs, ok := luaInt(arr[2])
+	if !ok {
 		return Decision{Allow: false}, nil
 	}
 	if secs < 0 {
@@ -201,6 +186,28 @@ func parseDecision(raw any) (Decision, error) {
 	}
 	d := time.Duration(secs) * time.Second
 	return Decision{Allow: false, RetryAfter: &d}, nil
+}
+
+// luaInt coerces one of the shapes go-redis exposes for a Lua-returned
+// integer into an int64. Depending on connection setup and Redis version
+// the same Lua `return 1` can surface as int64, float64, or a stringified
+// number — all three paths are tolerated; anything else returns ok=false
+// so the caller can degrade gracefully.
+func luaInt(v any) (int64, bool) {
+	switch x := v.(type) {
+	case int64:
+		return x, true
+	case float64:
+		return int64(x), true
+	case string:
+		n, err := strconv.ParseInt(x, 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		return n, true
+	default:
+		return 0, false
+	}
 }
 
 // newNonce returns 16 hex chars sourced from crypto/rand. Short enough to

@@ -29,11 +29,8 @@ description: 이 repo 에서 코드를 만지기 전에 사용. 모든 변경이
 
 ### 2. GitHub issue 생성
 - `gh issue create --title "<type>: <short imperative>" --body "..."`
-- Issue body 필수 구성:
-  - **Problem** — 무엇이 깨졌나 / 빠졌나 / 불분명한가
-  - **Proposed approach** — 단락이 아니라 bullets
-  - **Acceptance criteria** — 리뷰어가 체크할 수 있는 체크박스
-  - **Out of scope** — 이 issue 가 의도적으로 *건드리지 않는* 것
+- Issue body 는 **평범한 산문**. 문제 → 제안 → 범위 외 순서면 충분. 체크박스/이모지/표 남발 금지 — 진짜 체크할 항목이나 비교가 있을 때만.
+- "draft, pending review" 같은 자기 narration 류 disclaimer 는 issue body 에 넣지 않는다 (그건 PR body 에서 필요하면 한 줄).
 - Title prefix 는 Conventional Commits 준수: `feat:`, `fix:`, `chore:`, `docs:`, `refactor:`, `test:`, `perf:`, `ci:`, `build:`.
 - Issue 번호 캡쳐 — 이후 모든 산출물이 이걸 참조한다.
 
@@ -51,25 +48,18 @@ git switch -c <type>/<issue-num>-<slug>     # feat/12-provider-interface
 - 명시적 경로로 stage (`git add path/to/file`). `git add .` / `git add -A` 금지.
 - `--no-verify` 금지. hook 실패 시 root cause 고치고 **새 commit** (`--amend` 금지).
 - Commit 은 atomic — 논리적 변경 하나당 commit 하나. 멀티 스텝 작업 = 멀티 commit PR.
-- 모든 commit 끝에 `Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>` 트레일러.
+- Body 는 *무엇이 바뀌었고 왜* 만. "claude[bot] caught X", "agent draft" 류 자기 narration 류 표현 안 씀.
+- 모든 commit 끝에 `Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>` 트레일러. 이게 본 repo 의 honesty signal — agent-assisted 임을 git history 에 남기는 단 한 줄.
 
 ### 5. Push + PR 생성
 ```bash
 git push -u origin <branch>
-gh pr create \
-  --base main \
-  --title "<issue 와 동일하거나 정제된 표현>" \
-  --body "Closes #<issue-num>
-
-## Summary
-- ...
-
-## Test plan
-- [ ] ..."
+gh pr create --base main --title "<issue 와 동일하거나 정제된 표현>" --body "..."
 ```
-- `Closes #N` 필수 — 머지 시 issue 자동 close.
-- PR body 는 clinical: **Summary** + **Test plan** + (선택) **Out of scope**. 본질적인 WHY 는 commit 메시지 body 에, PR body 가 아님.
-- **유지보수자의 비공개 머지 게이트** (`docs/workflow/agent-driven-development.md`) 를 PR body 나 commit 메시지에 옮겨 적지 말 것. 그건 사고 도구지 템플릿 항목이 아니다.
+- PR body 첫 줄은 `Closes #<issue-num>` — 머지 시 issue 자동 close.
+- 본문은 **평범한 산문**. 무엇이 바뀌었고 리뷰어가 어디를 봐야 하는지가 핵심. "Summary / Test plan / Out of scope" 같은 rigid template 강제 안 함 — 진짜 actionable checkbox 가 있을 때만 checkbox 사용. 이모지 (✅, 🎉, 🤖) 메인 메시지에서 빼기.
+- "draft, pending review", "agent draft" 류 self-narration 안 씀. 필요하면 한 줄로 "interface decisions land via ADR-N before code" 같이 사실로 진술.
+- **유지보수자의 비공개 머지 게이트** (`docs/workflow/agent-driven-development.md`) 를 PR body / commit 메시지에 옮겨 적지 말 것 — 사고 도구지 템플릿 항목 아님.
 
 ### 6. AI 리뷰 + CI 대기
 - **AI 리뷰어** 가 `.github/workflows/ai-review.yml` 를 통해 자동 실행:

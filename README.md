@@ -134,8 +134,10 @@ OPENAI_API_KEY=sk-... go run ./examples/basic
 - [ADR-002 — Provider interface design](docs/adr/0002-provider-interface-design.md)
 - [ADR-003 — Model routing strategy](docs/adr/0003-model-routing-strategy.md)
 - [ADR-004 — Failover trigger + retry policy](docs/adr/0004-failover-trigger-and-retry.md)
+- [ADR-005 — Distributed rate limit strategy](docs/adr/0005-distributed-rate-limit.md)
 - [Roadmap](docs/roadmap.md)
-- [Agent-driven development rules](docs/workflow/agent-driven-development.md)
+- [Contributing — development workflow + agent-assisted approach](CONTRIBUTING.md)
+- [Agent-driven development rules (internal)](docs/workflow/agent-driven-development.md)
 
 ---
 

@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"strconv"
 	"time"
@@ -52,8 +51,12 @@ local nonce  = ARGV[6]
 local rpmLim = tonumber(ARGV[2])
 local tpmLim = tonumber(ARGV[3])
 
-redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, cutoff)
-redis.call('ZREMRANGEBYSCORE', KEYS[2], 0, cutoff)
+-- Exclusive upper bound (the '(' prefix) matches MemoryBackend's
+-- at.Before(cutoff) semantic: an entry whose score equals cutoff is
+-- kept. Without this the two backends would disagree on the boundary
+-- by one second.
+redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, '(' .. cutoff)
+redis.call('ZREMRANGEBYSCORE', KEYS[2], 0, '(' .. cutoff)
 
 if rpmLim > 0 then
   local rpmUsed = redis.call('ZCARD', KEYS[1])
@@ -173,17 +176,24 @@ func parseDecision(raw any) (Decision, error) {
 	if len(arr) < 3 {
 		return Decision{Allow: false}, nil
 	}
-	secs, ok := arr[2].(int64)
-	if !ok {
-		// Lua sometimes returns floats through redigo/go-redis; tolerate.
-		if s, sok := arr[2].(string); sok {
-			if v, err := strconv.ParseInt(s, 10, 64); err == nil {
-				secs = v
-				ok = true
-			}
+
+	// go-redis may surface Lua numeric returns as int64, float64, or even
+	// a stringified number depending on connection setup and Redis
+	// version. All three paths are tolerated; an unparseable value
+	// degrades to "no hint" rather than failing the deny.
+	var secs int64
+	switch v := arr[2].(type) {
+	case int64:
+		secs = v
+	case float64:
+		secs = int64(v)
+	case string:
+		parsed, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return Decision{Allow: false}, nil
 		}
-	}
-	if !ok {
+		secs = parsed
+	default:
 		return Decision{Allow: false}, nil
 	}
 	if secs < 0 {
@@ -200,7 +210,7 @@ func parseDecision(raw any) (Decision, error) {
 func newNonce() (string, error) {
 	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {
-		return "", errors.New("rand read failed")
+		return "", fmt.Errorf("rand read: %w", err)
 	}
 	return hex.EncodeToString(b[:]), nil
 }

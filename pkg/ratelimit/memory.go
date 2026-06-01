@@ -53,14 +53,21 @@ func NewMemory(opts Options) *MemoryBackend {
 // it returns a deny Decision with the duration until the oldest in-window
 // entry expires. On allow, it appends a conservative reservation entry.
 func (m *MemoryBackend) Allow(_ context.Context, providerName, apiKeyHash string, req provider.ChatRequest) (Decision, error) {
-	now := m.opts.now()
-	cutoff := now.Add(-time.Minute)
-
 	tokens := EstimateTokens(req)
 	key := bucketKey(providerName, apiKeyHash)
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	// `now` is computed inside the lock so the appended entry's timestamp
+	// is monotonic with respect to earlier appends in the same bucket.
+	// Without this, two concurrent goroutines could capture `now` outside
+	// the lock and then enqueue entries in a non-monotonic order, breaking
+	// the sorted invariant pruneBefore relies on. (The wall-clock skew is
+	// nanoseconds in practice and never crosses a 1-minute window, but the
+	// invariant is cheaper to maintain than to reason about each time.)
+	now := m.opts.now()
+	cutoff := now.Add(-time.Minute)
 
 	w, ok := m.buckets[key]
 	if !ok {

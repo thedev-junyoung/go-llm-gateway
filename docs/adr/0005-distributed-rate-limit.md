@@ -39,13 +39,13 @@ LLM API key 는 vendor 마다 RPM (Requests Per Minute) + TPM (Tokens Per Minute
 
 ### Q2. 알고리즘
 
-- **Decision:** B — **Sliding window counter** (Redis 의 경우 SortedSet + Lua script 로 원자성).
+- **Decision:** **Sliding window log** (Redis 의 경우 SortedSet + Lua script 로 원자성).
 - **Agent reasoning:** 네 가지 후보 비교:
-  - **Sliding window log** — 정확하지만 메모리 비용 ↑ (요청마다 timestamp 저장). LLM API 트래픽 (분당 수백~수천) 에서 메모리 압박.
-  - **Sliding window counter** — log 의 메모리를 bucket (예: 1초) 단위로 압축. 정확도 손실 < 5% (LLM 한도 운영에 충분). Redis SortedSet 으로 한 줄 ZADD + ZREMRANGEBYSCORE 로 구현 가능.
+  - **Sliding window log** — 요청마다 timestamp 를 SortedSet 에 ZADD, window 밖 entry 는 ZREMRANGEBYSCORE 로 pruning. 메모리는 요청 수에 비례하나 LLM 트래픽 (분당 수백~수천 요청 / key) 에서 충분히 허용 (각 entry ~30 bytes × 수천 = 100KB 미만). Atomic Lua 가 가장 단순.
+  - **Sliding window counter** — log 의 메모리를 bucket (예: 1초) 단위로 HINCRBY 로 압축. LLM 운영 트래픽에서는 log 의 메모리 부담이 작아 counter 의 복잡성을 정당화 못 함. window edge 가 bucket 경계에서 약간 부정확.
   - **Token bucket** — burst 허용. 그러나 vendor 한도는 strict 한 sliding window (예: OpenAI "RPM in any 60-second window") → token bucket 의 burst 가 vendor 429 trigger.
   - **Fixed window** — 구현 단순하지만 window 경계에서 2× 한도 트래픽 가능 (notorious flaw). vendor 가 즉시 429.
-- **왜 이 결정이 정당한가:** vendor 의 실제 측정 방식에 가장 가까운 알고리즘이 sliding window. Counter 변종이 메모리/CPU 비용을 의미 있게 낮춤. Token bucket 의 burst 는 vendor 한도에서 정당화 불가.
+- **왜 이 결정이 정당한가:** vendor 의 실제 측정 방식에 가장 가까운 알고리즘이 sliding window. LLM 트래픽 규모에서 log 의 메모리는 부담 아님 — counter 의 복잡성 (bucket sum 로직, 경계 부정확성) 을 도입할 동기가 약함. Token bucket 의 burst 는 vendor 한도에서 정당화 불가.
 - **Maintainer note:** <!-- TODO: 본인 한 줄 voice 로 -->
 
 ### Q3. 측정 시점 (entry vs after-response)
@@ -174,37 +174,53 @@ var _ RateLimiter = (*RedisBackend)(nil)
 Lua script (atomic; runs on each `Allow`):
 
 ```lua
--- KEYS[1] = ratelimit:{provider}:{key_hash}:rpm:{minute_window}
--- KEYS[2] = ratelimit:{provider}:{key_hash}:tpm:{minute_window}
--- ARGV[1] = now (unix seconds)
--- ARGV[2] = rpm_limit
--- ARGV[3] = tpm_limit
--- ARGV[4] = estimated_tokens (input estimate + max_tokens)
--- ARGV[5] = window_seconds (60)
+-- KEYS[1] = ratelimit:{provider}:{key_hash}:rpm
+-- KEYS[2] = ratelimit:{provider}:{key_hash}:tpm
+-- ARGV[1] = now              (unix seconds, integer)
+-- ARGV[2] = rpm_limit        (integer)
+-- ARGV[3] = tpm_limit        (integer)
+-- ARGV[4] = estimated_tokens (input estimate + max_tokens, integer)
+-- ARGV[5] = window_seconds   (60)
+-- ARGV[6] = nonce            (per-request UUID supplied by caller — prevents member collision)
 
-local now = tonumber(ARGV[1])
+local now    = tonumber(ARGV[1])
 local cutoff = now - tonumber(ARGV[5])
+local tokens = tonumber(ARGV[4])
+local nonce  = ARGV[6]
 
--- Prune entries older than the window
+-- Prune entries older than the window.
 redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, cutoff)
 redis.call('ZREMRANGEBYSCORE', KEYS[2], 0, cutoff)
 
+-- RPM: one member per request, score=timestamp. ZCARD = requests in window.
 local rpm_used = redis.call('ZCARD', KEYS[1])
--- TPM uses ZSET scores as token counts; sum them
-local entries = redis.call('ZRANGEBYSCORE', KEYS[2], cutoff, now, 'WITHSCORES')
+
+-- TPM: score=timestamp (used only for window pruning).
+--      member="<tokens>:<nonce>" — we decode tokens back from the member.
+--      (Using score as the token count would collide with window pruning,
+--       and using member as just "<tokens>" would dedup same-token requests.)
+local tpm_entries = redis.call('ZRANGEBYSCORE', KEYS[2], cutoff, '+inf')
 local tpm_used = 0
-for i = 2, #entries, 2 do tpm_used = tpm_used + tonumber(entries[i]) end
+for i = 1, #tpm_entries do
+  local member = tpm_entries[i]
+  local sep = string.find(member, ':')
+  if sep then tpm_used = tpm_used + tonumber(string.sub(member, 1, sep - 1)) end
+end
 
-if rpm_used + 1 > tonumber(ARGV[2]) then return {0, 'rpm'} end
-if tpm_used + tonumber(ARGV[4]) > tonumber(ARGV[3]) then return {0, 'tpm'} end
+if rpm_used + 1      > tonumber(ARGV[2]) then return {0, 'rpm'} end
+if tpm_used + tokens > tonumber(ARGV[3]) then return {0, 'tpm'} end
 
--- Reserve
-redis.call('ZADD', KEYS[1], now, now .. ':' .. redis.sha1hex(ARGV[4]))
-redis.call('ZADD', KEYS[2], now, ARGV[4])
+-- Reserve. Nonce makes members unique so concurrent same-second / same-token
+-- requests don't deduplicate in the ZSET.
+redis.call('ZADD', KEYS[1], now, tostring(now) .. ':' .. nonce)
+redis.call('ZADD', KEYS[2], now, tostring(tokens) .. ':' .. nonce)
 redis.call('EXPIRE', KEYS[1], tonumber(ARGV[5]))
 redis.call('EXPIRE', KEYS[2], tonumber(ARGV[5]))
 return {1}
 ```
+
+The Go caller generates a UUID per `Allow` and passes it as `ARGV[6]`. The
+nonce is opaque to Redis — only used to keep ZSET members unique.
 
 **gateway.Chat 통합** (ADR-004 의 loop 안에서):
 

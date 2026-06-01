@@ -335,7 +335,7 @@ func (g *Gateway) Chat(ctx context.Context, req provider.ChatRequest) (provider.
 
 ## Open Questions
 
-- [ ] Provider 인터페이스에 `KeyHash() string` 추가 vs 별도 `RateLimitable` optional interface (architecture base-layer rule 의 적용 결정)
+- [x] **(해결됨)** Provider 인터페이스에 `KeyHash() string` 직접 추가 — 옵셔널 interface fallback 보다 정직한 layering. Pre-v0.1 이라 외부 consumer 없어 breaking change 부담 없음. PR #69 에서 land.
 - [ ] Token estimation 알고리즘 — char/4 휴리스틱 vs tiktoken/cl100k_base library 의존 (정확도 vs 의존성 트레이드오프)
 - [ ] Burst 허용을 위한 별도 short-window check (1초/10초) — v0.2 에서 사용자 피드백 받고
 - [ ] Sliding window counter 의 bucket 크기 조정 가능 옵션 (현재 1초 fixed) — 정밀도 vs 메모리

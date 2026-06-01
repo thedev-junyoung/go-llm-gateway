@@ -9,6 +9,8 @@ package anthropic
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -40,6 +42,7 @@ var defaultModels = map[string]struct{}{
 // Client is the Anthropic adapter.
 type Client struct {
 	apiKey           string
+	keyHash          string // computed once in New so KeyHash stays allocation-free
 	baseURL          string
 	apiVersion       string
 	http             *http.Client
@@ -99,8 +102,10 @@ func WithAPIVersion(v string) Option {
 
 // New constructs an Anthropic provider client. apiKey is required.
 func New(apiKey string, opts ...Option) *Client {
+	sum := sha256.Sum256([]byte(apiKey))
 	c := &Client{
 		apiKey:     apiKey,
+		keyHash:    hex.EncodeToString(sum[:]),
 		baseURL:    defaultBaseURL,
 		apiVersion: defaultAPIVersion,
 		http:       &http.Client{Timeout: defaultTimeout},
@@ -120,6 +125,11 @@ func (c *Client) SupportsModel(model string) bool {
 	_, ok := c.models[model]
 	return ok
 }
+
+// KeyHash returns a stable hex SHA-256 of the configured API key. The
+// plaintext key never leaves this struct. The digest is computed once in
+// New so this accessor stays allocation-free on the rate-limit hot path.
+func (c *Client) KeyHash() string { return c.keyHash }
 
 // Wire types. Package-private — callers go through provider.ChatRequest /
 // provider.ChatResponse only.

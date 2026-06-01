@@ -23,6 +23,31 @@ func TestClient_Name(t *testing.T) {
 	}
 }
 
+func TestClient_KeyHash_StableAndDistinct(t *testing.T) {
+	t.Parallel()
+
+	a := openai.New("sk-aaa")
+	b := openai.New("sk-bbb")
+	a2 := openai.New("sk-aaa")
+
+	if a.KeyHash() == "" {
+		t.Fatal("KeyHash empty")
+	}
+	if len(a.KeyHash()) != 64 {
+		t.Errorf("KeyHash length = %d, want 64 (hex SHA-256)", len(a.KeyHash()))
+	}
+	if a.KeyHash() != a2.KeyHash() {
+		t.Error("same key produces different hashes — not stable")
+	}
+	if a.KeyHash() == b.KeyHash() {
+		t.Error("different keys produce the same hash — collision")
+	}
+	// Plaintext must not leak into the hash output.
+	if strings.Contains(a.KeyHash(), "sk-aaa") {
+		t.Error("KeyHash exposes plaintext key")
+	}
+}
+
 func TestClient_SupportsModel(t *testing.T) {
 	t.Parallel()
 

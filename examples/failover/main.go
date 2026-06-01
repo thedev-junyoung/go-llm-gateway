@@ -91,6 +91,10 @@ func (f *flakyProvider) SupportsModel(model string) bool {
 	return false
 }
 
+// KeyHash returns a constant identifier — this demo provider has no
+// credential, but it still needs to satisfy the Provider interface.
+func (f *flakyProvider) KeyHash() string { return "example-" + f.name }
+
 func (f *flakyProvider) Chat(_ context.Context, _ provider.ChatRequest) (provider.ChatResponse, error) {
 	slog.Info("flaky primary attempted", "vendor", f.name)
 	return provider.ChatResponse{}, provider.NewProviderError(

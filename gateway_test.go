@@ -28,6 +28,7 @@ func newFake(name string, models []string, chat func(context.Context, provider.C
 
 func (f *fakeProvider) Name() string                    { return f.name }
 func (f *fakeProvider) SupportsModel(model string) bool { _, ok := f.models[model]; return ok }
+func (f *fakeProvider) KeyHash() string                 { return "fake-" + f.name }
 func (f *fakeProvider) Chat(ctx context.Context, req provider.ChatRequest) (provider.ChatResponse, error) {
 	return f.ChatFn(ctx, req)
 }

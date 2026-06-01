@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"github.com/thedev-junyoung/thedev-junyoung-go-llm-gateway/pkg/provider"
+	"github.com/thedev-junyoung/thedev-junyoung-go-llm-gateway/pkg/ratelimit"
 	"github.com/thedev-junyoung/thedev-junyoung-go-llm-gateway/pkg/router"
 )
 
@@ -21,6 +23,15 @@ type Config struct {
 	// priority — for a given model, the first provider whose SupportsModel
 	// returns true serves the request (see ADR-003).
 	Providers []provider.Provider
+
+	// RateLimit, when non-nil, is consulted before every provider attempt
+	// and reconciled with actual Usage after every successful call (ADR-005).
+	// A denied Allow surfaces as a *provider.ProviderError with Type ==
+	// ErrorTypeRateLimit and triggers the same failover loop as a vendor 429
+	// (ADR-005 Q7). Backend errors are logged and the request proceeds —
+	// FailOpen is the contract default; the vendor's own 429 remains the
+	// safety net.
+	RateLimit ratelimit.RateLimiter
 }
 
 // Gateway is the composition root: it owns the providers and dispatches
@@ -29,6 +40,7 @@ type Config struct {
 // metrics recorder, etc.) that the constructor enforces.
 type Gateway struct {
 	providers []provider.Provider
+	rateLimit ratelimit.RateLimiter // nil means rate limiting disabled
 }
 
 // ErrNoProviders is returned by New when Config.Providers is empty.
@@ -46,7 +58,10 @@ func New(cfg Config) (*Gateway, error) {
 			return nil, fmt.Errorf("gateway: Config.Providers[%d] is nil", i)
 		}
 	}
-	return &Gateway{providers: cfg.Providers}, nil
+	return &Gateway{
+		providers: cfg.Providers,
+		rateLimit: cfg.RateLimit,
+	}, nil
 }
 
 // Chat routes the request through the candidate chain returned by the
@@ -87,8 +102,35 @@ func (g *Gateway) Chat(ctx context.Context, req provider.ChatRequest) (provider.
 			return provider.ChatResponse{}, cerr
 		}
 
+		// Rate-limit pre-check (ADR-005). A denied Allow produces the same
+		// sentinel as a vendor 429 so the failover loop walks to the next
+		// candidate without special-casing the origin (ADR-005 Q7).
+		if g.rateLimit != nil {
+			d, lerr := g.rateLimit.Allow(ctx, p.Name(), p.KeyHash(), req)
+			if lerr != nil {
+				// FailOpen: log and proceed. FailClosed wiring lands once a
+				// backend that can actually fail (Redis) is in the tree.
+				slog.WarnContext(ctx, "ratelimit backend error",
+					"vendor", p.Name(), "err", lerr)
+			} else if !d.Allow {
+				pe := provider.NewProviderError(p.Name(), provider.ErrorTypeRateLimit, 0, true,
+					"rate limited by gateway", nil)
+				if d.RetryAfter != nil {
+					pe = pe.WithRetryAfter(*d.RetryAfter)
+				}
+				lastErr = pe
+				continue
+			}
+		}
+
 		resp, cerr := p.Chat(ctx, req)
 		if cerr == nil {
+			if g.rateLimit != nil {
+				if rerr := g.rateLimit.Record(ctx, p.Name(), p.KeyHash(), resp.Usage); rerr != nil {
+					slog.WarnContext(ctx, "ratelimit record failed",
+						"vendor", p.Name(), "err", rerr)
+				}
+			}
 			return resp, nil
 		}
 		lastErr = cerr

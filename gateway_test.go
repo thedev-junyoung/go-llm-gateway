@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	gateway "github.com/thedev-junyoung/thedev-junyoung-go-llm-gateway"
 	"github.com/thedev-junyoung/thedev-junyoung-go-llm-gateway/pkg/provider"
+	"github.com/thedev-junyoung/thedev-junyoung-go-llm-gateway/pkg/ratelimit"
 )
 
 // fakeProvider exercises Gateway without dragging in the real OpenAI or
@@ -352,5 +355,185 @@ func TestChat_Failover_CtxCancelMidLoop_DualWrap(t *testing.T) {
 	}
 	if fallbackCalls != 0 {
 		t.Errorf("fallbackCalls = %d, want 0 (ctx cancelled before fallback try)", fallbackCalls)
+	}
+}
+
+// fakeLimiter is a programmable RateLimiter for the gateway wiring tests.
+// allowFn answers Allow; recordCount tracks Record calls.
+type fakeLimiter struct {
+	allowFn     func(provider string) (ratelimit.Decision, error)
+	allowCalls  int64
+	recordCalls int64
+}
+
+func (f *fakeLimiter) Allow(_ context.Context, providerName, _ string, _ provider.ChatRequest) (ratelimit.Decision, error) {
+	atomic.AddInt64(&f.allowCalls, 1)
+	if f.allowFn == nil {
+		return ratelimit.Decision{Allow: true}, nil
+	}
+	return f.allowFn(providerName)
+}
+
+func (f *fakeLimiter) Record(_ context.Context, _, _ string, _ provider.Usage) error {
+	atomic.AddInt64(&f.recordCalls, 1)
+	return nil
+}
+
+func TestChat_RateLimit_AllowsAndRecords(t *testing.T) {
+	t.Parallel()
+
+	p := newFake("openai", []string{"gpt-4o"},
+		func(_ context.Context, _ provider.ChatRequest) (provider.ChatResponse, error) {
+			return provider.ChatResponse{Content: "ok", Usage: provider.Usage{InputTokens: 7, OutputTokens: 3}}, nil
+		})
+	lim := &fakeLimiter{}
+
+	gw, err := gateway.New(gateway.Config{
+		Providers: []provider.Provider{p},
+		RateLimit: lim,
+	})
+	if err != nil {
+		t.Fatalf("New err = %v", err)
+	}
+
+	resp, err := gw.Chat(context.Background(), provider.ChatRequest{
+		Model:    "gpt-4o",
+		Messages: []provider.Message{{Role: provider.RoleUser, Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("Chat err = %v", err)
+	}
+	if resp.Content != "ok" {
+		t.Errorf("Content = %q, want %q", resp.Content, "ok")
+	}
+	if got := atomic.LoadInt64(&lim.allowCalls); got != 1 {
+		t.Errorf("allowCalls = %d, want 1", got)
+	}
+	if got := atomic.LoadInt64(&lim.recordCalls); got != 1 {
+		t.Errorf("recordCalls = %d, want 1 (Record runs on success)", got)
+	}
+}
+
+func TestChat_RateLimit_DenyOnPrimary_FailsOver(t *testing.T) {
+	t.Parallel()
+
+	primaryCalls, fallbackCalls := 0, 0
+	primary := newFake("openai", []string{"gpt-4o"},
+		func(_ context.Context, _ provider.ChatRequest) (provider.ChatResponse, error) {
+			primaryCalls++
+			return provider.ChatResponse{Content: "should never run"}, nil
+		})
+	fallback := newFake("azure-openai", []string{"gpt-4o"},
+		func(_ context.Context, _ provider.ChatRequest) (provider.ChatResponse, error) {
+			fallbackCalls++
+			return provider.ChatResponse{Content: "served by fallback", FinishReason: provider.FinishStop}, nil
+		})
+
+	wait := 2 * time.Second
+	lim := &fakeLimiter{
+		allowFn: func(name string) (ratelimit.Decision, error) {
+			if name == "openai" {
+				return ratelimit.Decision{Allow: false, RetryAfter: &wait}, nil
+			}
+			return ratelimit.Decision{Allow: true}, nil
+		},
+	}
+
+	gw, err := gateway.New(gateway.Config{
+		Providers: []provider.Provider{primary, fallback},
+		RateLimit: lim,
+	})
+	if err != nil {
+		t.Fatalf("New err = %v", err)
+	}
+
+	resp, err := gw.Chat(context.Background(), provider.ChatRequest{
+		Model:    "gpt-4o",
+		Messages: []provider.Message{{Role: provider.RoleUser, Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("Chat err = %v, want nil", err)
+	}
+	if resp.Content != "served by fallback" {
+		t.Errorf("Content = %q, want %q", resp.Content, "served by fallback")
+	}
+	if primaryCalls != 0 {
+		t.Errorf("primaryCalls = %d, want 0 (pre-empt MUST short-circuit before Chat)", primaryCalls)
+	}
+	if fallbackCalls != 1 {
+		t.Errorf("fallbackCalls = %d, want 1", fallbackCalls)
+	}
+}
+
+func TestChat_RateLimit_DenyAll_ReturnsErrRateLimitedWithRetryAfter(t *testing.T) {
+	t.Parallel()
+
+	p := newFake("openai", []string{"gpt-4o"}, nil) // Chat must not run
+	wait := 5 * time.Second
+	lim := &fakeLimiter{
+		allowFn: func(string) (ratelimit.Decision, error) {
+			return ratelimit.Decision{Allow: false, RetryAfter: &wait}, nil
+		},
+	}
+
+	gw, err := gateway.New(gateway.Config{
+		Providers: []provider.Provider{p},
+		RateLimit: lim,
+	})
+	if err != nil {
+		t.Fatalf("New err = %v", err)
+	}
+
+	_, err = gw.Chat(context.Background(), provider.ChatRequest{
+		Model:    "gpt-4o",
+		Messages: []provider.Message{{Role: provider.RoleUser, Content: "hi"}},
+	})
+	if !errors.Is(err, provider.ErrRateLimited) {
+		t.Errorf("errors.Is(err, ErrRateLimited) = false, want true")
+	}
+	var pe *provider.ProviderError
+	if !errors.As(err, &pe) {
+		t.Fatalf("err is not *ProviderError: %v", err)
+	}
+	if pe.RetryAfter == nil || *pe.RetryAfter != wait {
+		t.Errorf("RetryAfter = %v, want %v", pe.RetryAfter, wait)
+	}
+}
+
+func TestChat_RateLimit_BackendError_FailsOpen(t *testing.T) {
+	t.Parallel()
+
+	called := false
+	p := newFake("openai", []string{"gpt-4o"},
+		func(_ context.Context, _ provider.ChatRequest) (provider.ChatResponse, error) {
+			called = true
+			return provider.ChatResponse{Content: "served despite limiter outage"}, nil
+		})
+	lim := &fakeLimiter{
+		allowFn: func(string) (ratelimit.Decision, error) {
+			return ratelimit.Decision{}, errors.New("limiter backend is on fire")
+		},
+	}
+
+	gw, err := gateway.New(gateway.Config{
+		Providers: []provider.Provider{p},
+		RateLimit: lim,
+	})
+	if err != nil {
+		t.Fatalf("New err = %v", err)
+	}
+
+	resp, err := gw.Chat(context.Background(), provider.ChatRequest{
+		Model:    "gpt-4o",
+		Messages: []provider.Message{{Role: provider.RoleUser, Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("Chat err = %v, want nil (fail-open contract)", err)
+	}
+	if !called {
+		t.Error("provider.Chat was not called — fail-open contract requires the request to proceed")
+	}
+	if resp.Content != "served despite limiter outage" {
+		t.Errorf("Content = %q", resp.Content)
 	}
 }

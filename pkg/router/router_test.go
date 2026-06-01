@@ -33,6 +33,7 @@ func (f *fakeProvider) SupportsModel(model string) bool {
 	_, ok := f.models[model]
 	return ok
 }
+func (f *fakeProvider) KeyHash() string { return "fake-" + f.name }
 func (f *fakeProvider) Chat(_ context.Context, _ provider.ChatRequest) (provider.ChatResponse, error) {
 	return provider.ChatResponse{}, errors.New("fakeProvider.Chat not used in router tests")
 }

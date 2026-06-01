@@ -9,6 +9,8 @@ package anthropic
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -119,6 +121,13 @@ func (c *Client) Name() string { return vendorName }
 func (c *Client) SupportsModel(model string) bool {
 	_, ok := c.models[model]
 	return ok
+}
+
+// KeyHash returns a stable hex SHA-256 of the configured API key. The
+// plaintext key never leaves this struct.
+func (c *Client) KeyHash() string {
+	sum := sha256.Sum256([]byte(c.apiKey))
+	return hex.EncodeToString(sum[:])
 }
 
 // Wire types. Package-private — callers go through provider.ChatRequest /

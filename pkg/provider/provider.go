@@ -28,6 +28,14 @@ type Provider interface {
 	// model id (e.g. "gpt-4o", "claude-opus-4-7"). Hot-path check — must not
 	// make network calls.
 	SupportsModel(model string) bool
+
+	// KeyHash returns a stable, opaque identifier for the credential this
+	// provider is configured with — concretely, the hex SHA-256 of the API
+	// key. The plaintext key never leaves the adapter; only the hash crosses
+	// package boundaries. The rate-limit bucket key (ADR-005 Q5) combines
+	// Name() and KeyHash() so two clients of the same vendor with different
+	// keys count against separate quotas.
+	KeyHash() string
 }
 
 // Role identifies who authored a message. There is intentionally no

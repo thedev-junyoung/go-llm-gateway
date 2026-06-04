@@ -132,6 +132,17 @@ type ChatResponse struct {
 	// gateway's semver — callers that parse Raw own the regression risk on
 	// vendor SDK upgrades. See ADR-002 Consequences/Negative.
 	Raw json.RawMessage
+
+	// Attempts is the per-attempt trace of the Chat call (primary + any
+	// fallbacks the router tried). Caller-facing — see ADR-006 Q4. Adapters
+	// MUST NOT set this field; the gateway populates it. Empty on error paths
+	// that fail before any provider was reached.
+	//
+	// Same data is fed to MetricRecorder.OnAttempt for the metric/log sink;
+	// the two paths target different audiences (UI / request_id correlation
+	// vs operator dashboard). See ADR-006 Q4 sub-decision on diverge risk
+	// if the caller mutates the slice.
+	Attempts []AttemptInfo
 }
 
 // ErrorType is the gateway-normalized error category. Adapters map vendor

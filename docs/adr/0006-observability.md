@@ -82,6 +82,10 @@ Gateway 가 multi-vendor failover + per-key rate limit 까지 갖춘 v0.1.0-rc �
   - **B. Recorder hook 만** — gateway 내부 metric recorder 가 attempt 마다 콜백. caller 는 모름. 단점: caller 가 trace 정보 필요할 때 (response logging, request_id correlation) 별도 channel 필요.
   - **C. 둘 다** ✅ — Response 필드는 caller-facing, Recorder hook 은 metric/log facing. 의도가 명확.
 - **왜 이 결정이 정당한가:** ADR-004 가 미룬 이유 (metric 모듈의 요구 사항이 입력) 가 이제 명확해짐 — recorder 패턴이 metric/log 의 공통 sink, response 필드가 caller 의 debugging 용. 두 path 가 서로 직교.
+- **Sub-decision (타입 위치):** `AttemptInfo` / `FailoverInfo` / `Outcome` / `Origin` 은 `pkg/provider` 에 둔다. 대안은 `pkg/core` 같은 별 공유 타입 패키지를 만드는 것 — 검토했지만 reject:
+  - `Outcome` / `Origin` 은 observability 개념이긴 하나, **gateway 의 모든 attempt 가 type 으로 표현하는 동일 trace primitive** 이므로 provider 패키지가 자기 `Usage` / `ProviderError` 와 같이 두는 게 자연스럽다 (Usage / FinishReason 도 이미 provider 에 있음 — 둘 다 "응답 분류" 의미)
+  - `pkg/core` 신설은 provider 와 1:1 동일 의존 그래프를 갖는 빈 패키지 추가 — 책임 분리 효과 없이 import 한 줄만 늘림 (Go 패키지 비용 = vendoring + IDE indexing)
+  - 패키지 책임은 "vendor wire contract" + "그 attempt 의 trace primitive" 까지로 확장 — provider 책임 범위 확장은 의도된 선택, silent 가 아님 (본 sub-decision 으로 명시).
 - **Maintainer note:** <!-- TODO: 본인 한 줄 voice 로 -->
 
 ### Q5. Structured logging 표준
@@ -109,7 +113,21 @@ Gateway 가 multi-vendor failover + per-key rate limit 까지 갖춘 v0.1.0-rc �
 - **Decision:** **`key_hash` 는 metric label 에서 제외, `model` 은 표준 모델명만 허용**.
   - `vendor` label — provider.Name() (예: "openai", "anthropic") — 카디널리티 ≤ 10
   - `model` label — vendor 의 표준 model id ("gpt-4o", "claude-opus-4-7" 등) — 카디널리티 ≤ 50
-  - `outcome` label — `success` / `error_<type>` (ErrorType 9개) — 카디널리티 ≤ 10
+    - **whitelist 유래**: `Provider.SupportsModel(model)` 가 true 인 model id 만 그대로, 나머지는 `unknown` 으로 fallback. whitelist 는 vendor adapter 가 build time 에 결정 (정적). 신규 model 추가는 어댑터 patch + redeploy.
+    - **운영 가시성 보완**: `llm_gateway_unknown_model_total{vendor}` 별 counter 를 추가로 노출. unknown bucket 이 비정상으로 커지면 alert 발생 → silent silencing 회피. ADR-001 의 "production-grade" 정체성과 충돌 방지.
+  - `outcome` label — `success` 1개 + ErrorType 9개의 `error_<type>` (아래 enumeration) — 카디널리티 ≤ 10
+    | outcome value | trigger |
+    |---|---|
+    | `success` | provider.Chat 가 nil 에러 반환 |
+    | `error_rate_limit` | ErrorTypeRateLimit (vendor 429 또는 gateway pre-empt) |
+    | `error_auth` | ErrorTypeAuth (401) |
+    | `error_overloaded` | ErrorTypeOverloaded (Anthropic 등) |
+    | `error_server` | ErrorTypeServer (5xx) |
+    | `error_timeout` | ErrorTypeTimeout (ctx deadline / transport) |
+    | `error_invalid_input` | ErrorTypeInvalidInput (400 / 라우팅 실패) |
+    | `error_not_found` | ErrorTypeNotFound (404) |
+    | `error_permission` | ErrorTypePermission (403) |
+    | `error_unknown` | ErrorTypeUnknown 또는 *ProviderError 아닌 raw error |
   - `origin` label — 3-state — 카디널리티 = 3
   - `key_hash` 는 라벨 X — 비용 attribution 이 필요하면 별 metric (예: `llm_gateway_cost_usd_by_key_total`) 로 분리, 본 ADR 에서는 미포함.
 - **Agent reasoning:** Prometheus 의 cardinality 한도 (보통 ≤ 100k unique label combinations per metric) 를 안전하게 유지. `key_hash` 를 label 로 넣으면 사용자 수만큼 카디널리티 폭발 → Prometheus storage cost / Grafana query latency 증가. 비용 attribution 은 별 use case 라 별 metric 으로 분리.
@@ -154,9 +172,20 @@ type FailoverInfo struct {
 type Outcome string
 
 const (
-	OutcomeSuccess Outcome = "success"
-	// ErrorType 별 outcome (ErrorTypeRateLimit → "error_rate_limit" 등) — 자동 매핑
+	OutcomeSuccess           Outcome = "success"
+	OutcomeErrorRateLimit    Outcome = "error_rate_limit"
+	OutcomeErrorAuth         Outcome = "error_auth"
+	OutcomeErrorOverloaded   Outcome = "error_overloaded"
+	OutcomeErrorServer       Outcome = "error_server"
+	OutcomeErrorTimeout      Outcome = "error_timeout"
+	OutcomeErrorInvalidInput Outcome = "error_invalid_input"
+	OutcomeErrorNotFound     Outcome = "error_not_found"
+	OutcomeErrorPermission   Outcome = "error_permission"
+	OutcomeErrorUnknown      Outcome = "error_unknown"
 )
+
+// OutcomeFromErr 는 ErrorType → Outcome 매핑. 비-*ProviderError 는 ErrorUnknown.
+func OutcomeFromErr(err error) Outcome { /* switch on ErrorType */ }
 
 type Origin string
 
@@ -176,8 +205,16 @@ import (
 	"github.com/thedev-junyoung/thedev-junyoung-go-llm-gateway/pkg/provider"
 )
 
-// MetricRecorder 는 gateway 가 매 attempt 마다 호출하는 콜백 인터페이스. caller 는
-// 자체 backend (Prometheus / OTel / Datadog / no-op) 의 어댑터를 구현해 주입.
+// MetricRecorder 는 gateway 가 매 attempt / failover 마다 호출하는 콜백.
+//
+// CONTRACT: 구현체는 *반드시* 즉시 반환해야 한다. blocking work (remote exporter
+// flush, slow IO, sync.Mutex 경쟁) 가 필요하면 내부 buffer / goroutine 으로
+// 격리해야 한다. gateway 는 caller goroutine 에서 동기로 호출하므로, 느린
+// recorder 는 매 Chat 호출의 latency 에 직접 더해진다. AsyncWrapper (별 모듈)
+// 가 buffered channel 기반 표준 격리 패턴을 제공한다.
+//
+// 빠른 backend 는 동기 호출 OK (Prometheus Counter 는 atomic, NoOp 는 0-cost).
+// 느린 backend (OTel remote exporter, Datadog flush) 는 AsyncWrapper 권장.
 type MetricRecorder interface {
 	OnAttempt(ctx context.Context, info provider.AttemptInfo)
 	OnFailover(ctx context.Context, info provider.FailoverInfo)
@@ -189,14 +226,28 @@ type NoOpRecorder struct{}
 func (NoOpRecorder) OnAttempt(context.Context, provider.AttemptInfo)   {}
 func (NoOpRecorder) OnFailover(context.Context, provider.FailoverInfo) {}
 
-// gateway.Config 확장 — non-breaking.
+// 컴파일 타임 contract assertion.
+var _ MetricRecorder = NoOpRecorder{}
+```
+
+**gateway 패키지 (Config / New / ChatResponse 확장):**
+
+```go
+package gateway
+
+import (
+	"github.com/thedev-junyoung/thedev-junyoung-go-llm-gateway/pkg/metrics"
+	"github.com/thedev-junyoung/thedev-junyoung-go-llm-gateway/pkg/provider"
+	"github.com/thedev-junyoung/thedev-junyoung-go-llm-gateway/pkg/ratelimit"
+)
+
+// Config 확장 — non-breaking.
 type Config struct {
 	Providers []provider.Provider
 	RateLimit ratelimit.RateLimiter
 	Metrics   metrics.MetricRecorder // 새로 추가, nil 이면 New 가 NoOpRecorder{} 로 대체
 }
 
-// gateway.New 의 nil → NoOp 대체 (Chat pseudocode 의 nil-check 부담 제거).
 func New(cfg Config) (*Gateway, error) {
 	// ... 기존 validation ...
 	if cfg.Metrics == nil {
@@ -204,14 +255,20 @@ func New(cfg Config) (*Gateway, error) {
 	}
 	return &Gateway{providers: cfg.Providers, rateLimit: cfg.RateLimit, metrics: cfg.Metrics}, nil
 }
+```
 
-// provider.ChatResponse 확장 — non-breaking 필드 추가.
+`provider.ChatResponse` 자체에는 `Attempts []provider.AttemptInfo` 필드 추가
+— non-breaking. 호출자의 debugging / request_id correlation path.
+
+```go
+package provider
+
 type ChatResponse struct {
 	Content      string
 	FinishReason FinishReason
 	Usage        Usage
 	Raw          []byte
-	Attempts     []provider.AttemptInfo // 새로 추가, 호출자의 debugging 용
+	Attempts     []AttemptInfo // 새로 추가, 호출자 facing
 }
 ```
 
@@ -237,7 +294,8 @@ func (r *PromRecorder) OnFailover(ctx context.Context, info provider.FailoverInf
 **gateway.Chat 통합:**
 
 ```go
-// recordAttempt 는 OnAttempt 콜백을 호출하면서 recorder 의 panic 을 격리 (Risks 표).
+// recordAttempt / recordFailover 는 recorder panic 격리 (Risks 표). 두 hook 모두
+// 같은 패턴으로 처리 — 한쪽만 보호하면 OnFailover panic 시 Chat 전체가 crash.
 func (g *Gateway) recordAttempt(ctx context.Context, info provider.AttemptInfo) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -245,6 +303,16 @@ func (g *Gateway) recordAttempt(ctx context.Context, info provider.AttemptInfo) 
 		}
 	}()
 	g.metrics.OnAttempt(ctx, info)
+}
+
+func (g *Gateway) recordFailover(ctx context.Context, info provider.FailoverInfo) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.ErrorContext(ctx, "metrics.OnFailover panicked", "panic", r,
+				"from", info.FromVendor, "to", info.ToVendor)
+		}
+	}()
+	g.metrics.OnFailover(ctx, info)
 }
 
 func (g *Gateway) Chat(ctx context.Context, req provider.ChatRequest) (provider.ChatResponse, error) {
@@ -271,7 +339,7 @@ func (g *Gateway) Chat(ctx context.Context, req provider.ChatRequest) (provider.
 			if d, _ := g.rateLimit.Allow(ctx, p.Name(), p.KeyHash(), req); !d.Allow {
 				info := provider.AttemptInfo{
 					Vendor: p.Name(), Model: req.Model, AttemptN: n,
-					Outcome: "error_rate_limit", Origin: provider.OriginGatewayPreempt,
+					Outcome: provider.OutcomeErrorRateLimit, Origin: provider.OriginGatewayPreempt,
 				}
 				attempts = append(attempts, info)
 				g.recordAttempt(ctx, info)
@@ -300,8 +368,14 @@ func (g *Gateway) Chat(ctx context.Context, req provider.ChatRequest) (provider.
 
 		if !shouldFailover(cerr) { /* abort */ }
 		if n+1 < len(candidates) {
-			g.metrics.OnFailover(ctx, provider.FailoverInfo{
-				FromVendor: p.Name(), ToVendor: candidates[n+1].Name(), Reason: info.Error.Type,
+			var reason provider.ErrorType
+			if info.Error != nil { // asProviderError 가 nil 반환 가능 (비-ProviderError)
+				reason = info.Error.Type
+			} else {
+				reason = provider.ErrorTypeUnknown
+			}
+			g.recordFailover(ctx, provider.FailoverInfo{
+				FromVendor: p.Name(), ToVendor: candidates[n+1].Name(), Reason: reason,
 			})
 		}
 	}
@@ -331,7 +405,19 @@ func (g *Gateway) Chat(ctx context.Context, req provider.ChatRequest) (provider.
 - **단점:** ~5MB 외부 의존성, ctx propagation 룰이 spec 종속, OTel 안 쓰는 사용자에게 dead weight.
 - **안 선택한 이유:** YAGNI. Recorder 인터페이스가 OTel adapter 의 확장점 — 별 모듈로 도입 가능.
 
-### Alt 4 — Q7 `key_hash` label 포함
+### Alt 4 — Q1 비동기 채널 기반 recorder (sync 콜백 X)
+
+- **장점:** OnAttempt 가 `chan AttemptInfo` 에 send 만 하고 background goroutine 이 consume → gateway latency 에 recorder 의 blocking work 가 영향 X. backpressure 정책 (drop / block / sample) 을 인터페이스 수준에서 명시 가능.
+- **단점:** 인터페이스 자체가 비동기라 caller 의 logger / metrics backend 가 sync API 면 wrapping 부담. AsyncWrapper 를 **별 모듈로 제공**하면 사용자가 필요 시 선택 가능 — 인터페이스 자체는 sync 유지.
+- **안 선택한 이유:** 인터페이스 강제 비동기는 빠른 backend (Prometheus Counter 등) 의 use case 에서 overhead. CONTRACT godoc + AsyncWrapper 옵션 제공이 trade-off 균형.
+
+### Alt 5 — Q2 Log-only (metric emit 없이 `ChatResponse.Attempts` + slog)
+
+- **장점:** 라이브러리 코어에 metric 추상화 없음. caller 가 Loki / Vector 에서 slog 필드로 필요한 metric 을 직접 derive. ADR-002 의 최소 의존성 원칙에 더 보수적.
+- **단점:** 운영 dashboard 의 metric latency가 log pipeline 의 ingestion lag 에 종속 (보통 수 분). real-time alerting 어려움. Prometheus 사용자가 자체 log → metric adapter 작성 부담.
+- **안 선택한 이유:** ADR-001 의 "production-grade" 정체성 — real-time alerting 이 production gateway 의 baseline. Recorder 인터페이스 + nil → NoOp 이 log-only 사용자에게도 0-cost (nil 로 두면 됨).
+
+### Alt 6 — Q7 `key_hash` label 포함
 
 - **장점:** per-key 비용 attribution 즉시 가능.
 - **단점:** Cardinality 폭발 (사용자 수 = unique combinations). Prometheus / Grafana cost 증가.
@@ -353,7 +439,11 @@ func (g *Gateway) Chat(ctx context.Context, req provider.ChatRequest) (provider.
 
 - `gateway.Config.Metrics` 추가 필드 → caller 가 nil 또는 NoOp recorder 명시 결정 부담
 - `ChatResponse.Attempts` 가 매 호출 시 allocation — 빈 호출이라도 1+ entry 슬라이스. p99 latency 에 미미한 영향
-- Recorder hook 콜백이 caller goroutine 에서 실행 — recorder 가 느리면 gateway latency 에 영향. 빠른 구현 권장 (Prometheus 는 lock-free 카운터)
+- Recorder hook 콜백이 caller goroutine 에서 실행 — recorder 가 느리면 gateway latency 에 직접 더해진다. 빠른 구현 권장:
+  - Prometheus `Counter`: atomic (사실상 lock-free) — OK
+  - Prometheus `Histogram.Observe()`: **내부 `sync.Mutex` 사용** — 고트래픽 시 lock 경쟁 발생 가능. 단일 어댑터에서 attemptDuration histogram 호출이 매 attempt 마다 → p99 latency 에 영향 측정 필요.
+  - OTel remote exporter / Datadog flush 등 IO blocking 구현: 반드시 AsyncWrapper 로 격리 (recorder.go 의 godoc CONTRACT 참고).
+  - Recorder 가 내부 goroutine 을 spawn 하면 gateway 의 `recover()` 가 panic 못 잡음 — 그런 recorder 는 자체 recover 필수.
 
 ### Risks
 
@@ -380,6 +470,7 @@ func (g *Gateway) Chat(ctx context.Context, req provider.ChatRequest) (provider.
 - [x] **(해결됨)** rate limit backend 에러 시 origin — Q3 Sub-decision 에서 `vendor` 로 결정 (FailOpen path 가 vendor 호출로 이어지므로).
 - [ ] Recorder 의 ctx propagation 룰 — OTel adapter 가 등장하면 본 ADR 의 ctx 시그니처가 충분한지 재검토
 - [ ] Metric naming convention — Prometheus 의 `_total` / `_seconds` suffix 외에 다른 명명 규칙 (예: `_count`) 필요한지
-- [ ] Log sampling — 트래픽 폭증 시 OnAttempt 의 매 호출 slog.Info 가 부담. sampling 옵션을 본 ADR 에서 land 할지 별 ADR 로 미룰지
+- [ ] Log sampling — 트래픽 폭증 시 OnAttempt 의 매 호출 slog.Info 가 부담. sampling 옵션을 본 ADR 에서 land 할지 별 ADR 로 미룰지. `SampledRecorder` wrapper (예: 1/N 또는 reservoir 샘플링) 가 AsyncWrapper 와 같은 모듈에 적층 가능.
 - [ ] `Attempts` 슬라이스 길이 제한 — failover 가 10 vendor 깊이면 메모리 부담. cap 옵션?
+- [ ] `AsyncWrapper` 의 backpressure 정책 (drop oldest / drop newest / block / sample) — 어느 게 default 인가? 별 작은 ADR 후보.
 - [ ] OpenTelemetry 도입 시기 — 본 ADR 의 v0.2 후보를 별 ADR-008 로 분리할지 본 ADR 의 Q6 확장으로 갈지

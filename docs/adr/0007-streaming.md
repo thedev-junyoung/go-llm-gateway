@@ -243,12 +243,17 @@ func (g *Gateway) ChatStream(ctx context.Context, req provider.ChatRequest) (<-c
             continue // streaming 미지원 candidate skip
         }
         // Rate-limit pre-check + ctx check (Chat 과 동일)
+        attemptStart := time.Now()
         stream, err := sp.ChatStream(ctx, req)
         if err == nil {
             // 첫 chunk 받기 전. Metrics: TTFT histogram 은 첫 ContentDelta!=""
             // 시점에 Observe. wrapper goroutine 으로 intercept (아래 sketch).
-            return wrapWithMetrics(g, p, i, stream), nil
+            return wrapWithMetrics(ctx, g, p, i, attemptStart, stream), nil
         }
+        // pre-stream 실패도 TTFT histogram 에 outcome="pre_stream_failure" 로
+        // Observe — Q5 의 outcome 라벨 enum 이 dead value 안 되도록.
+        g.metrics.ObserveFirstTokenLatency(p.Name(), normalizedModel(req),
+            "pre_stream_failure", time.Since(attemptStart))
         lastErr = err
         if !shouldFailover(err) { return nil, err }
         // recordFailover (ADR-006) — pre-stream 이므로 동일 패턴.
@@ -272,26 +277,36 @@ func (g *Gateway) ChatStream(ctx context.Context, req provider.ChatRequest) (<-c
 // over the stream lifetime; per-chunk hop cost measured during the
 // implementation PR (wrapWithMetrics) and pinned in README.
 //
-// func wrapWithMetrics(g *Gateway, p provider.Provider, attemptN int,
+// func wrapWithMetrics(ctx context.Context, g *Gateway, p provider.Provider,
+//                      attemptN int, attemptStart time.Time,
 //                      in <-chan provider.StreamChunk) <-chan provider.StreamChunk {
 //     out := make(chan provider.StreamChunk, cap(in))
 //     go func() {
 //         defer close(out)
-//         start := time.Now()
 //         firstTokenSeen := false
 //         var lastChunk provider.StreamChunk
 //         for ch := range in {  // closes when adapter closes
 //             if !firstTokenSeen && ch.ContentDelta != "" {
 //                 firstTokenSeen = true
 //                 g.metrics.ObserveFirstTokenLatency(p.Name(), info.Model,
-//                     "success", time.Since(start))
+//                     "success", time.Since(attemptStart))
 //             }
 //             out <- ch
 //             lastChunk = ch
 //         }
+//         // First-token-not-reached path: distinguish ctx cancel from a
+//         // mid-stream failure that closed before any text arrived.
+//         if !firstTokenSeen {
+//             outcome := "pre_stream_failure"
+//             if ctx.Err() != nil {
+//                 outcome = "ctx_cancel_before_first_chunk"
+//             }
+//             g.metrics.ObserveFirstTokenLatency(p.Name(), info.Model,
+//                 outcome, time.Since(attemptStart))
+//         }
 //         outcome := outcomeFromChunk(lastChunk)  // success / error_*
 //         g.metrics.ObserveStreamDuration(p.Name(), info.Model, outcome,
-//             time.Since(start))
+//             time.Since(attemptStart))
 //     }()
 //     return out
 // }

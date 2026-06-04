@@ -245,6 +245,61 @@ func TestChatStream_CtxCancel_NoErrChunk(t *testing.T) {
 	}
 }
 
+// TestChatStream_CtxDeadline_NoErrChunk is the Q6 counterpart to the
+// explicit-cancel test — DeadlineExceeded follows the same close-only
+// path. Earlier implementation only excluded context.Canceled from
+// the Err-chunk emission, leaking an Err chunk on WithTimeout expiry;
+// this test pins that gap closed.
+func TestChatStream_CtxDeadline_NoErrChunk(t *testing.T) {
+	t.Parallel()
+
+	unblock := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher, _ := w.(http.Flusher)
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"))
+		if flusher != nil {
+			flusher.Flush()
+		}
+		<-unblock
+	}))
+	defer func() {
+		close(unblock)
+		srv.Close()
+	}()
+
+	c := openai.New("sk-test", openai.WithBaseURL(srv.URL))
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	stream, err := c.ChatStream(ctx, provider.ChatRequest{
+		Model:    "gpt-4o",
+		Messages: []provider.Message{{Role: provider.RoleUser, Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("ChatStream err = %v", err)
+	}
+
+	// Drain the channel until it closes. Any Err chunk would be a Q6
+	// violation — DeadlineExceeded must mirror Canceled's close-only
+	// semantics.
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case chunk, ok := <-stream:
+			if !ok {
+				return
+			}
+			if chunk.Err != nil {
+				t.Errorf("ctx-timeout produced Err chunk = %v, want channel close only", chunk.Err)
+			}
+		case <-deadline:
+			t.Fatal("channel did not close within 2s of ctx timeout")
+		}
+	}
+}
+
 // TestChatStream_KeepAliveAndCommentLinesIgnored pins SSE-spec tolerance:
 // blank lines and `: comment` lines are ignored without affecting the
 // chunk stream.

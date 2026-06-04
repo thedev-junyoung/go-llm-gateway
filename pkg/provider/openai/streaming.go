@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -165,6 +164,10 @@ func (c *Client) consumeStream(ctx context.Context, resp *http.Response, out cha
 		if payload == sseDoneMarker {
 			// Emit terminal chunk with the finish_reason + usage we
 			// accumulated, then return (channel closes via defer).
+			// TODO(v0.2): populate Raw with the original [DONE]-preceding
+			// event so tool_use / multi-modal callers can access the
+			// vendor payload (ADR-007 Q3 escape hatch). Deferred to
+			// keep PR-2 focused on the text path.
 			out <- provider.StreamChunk{
 				FinishReason: mapFinishReason(lastFinishReason),
 				Usage:        lastUsage,
@@ -207,7 +210,13 @@ func (c *Client) consumeStream(ctx context.Context, resp *http.Response, out cha
 		}
 	}
 
-	if err := scanner.Err(); err != nil && !errors.Is(err, context.Canceled) {
+	// Q6: ctx cancel / deadline → channel close only (no Err chunk).
+	// Anything else (vendor closed connection, network reset) is a real
+	// mid-stream failure → Q7 Err chunk. ctx.Err() captures both
+	// context.Canceled and context.DeadlineExceeded; checking that
+	// instead of errors.Is(err, context.Canceled) closes the gap where
+	// a WithTimeout ctx expiring leaked an Err chunk in violation of Q6.
+	if err := scanner.Err(); err != nil && ctx.Err() == nil {
 		out <- provider.StreamChunk{
 			FinishReason: provider.FinishUnknown,
 			Err:          mapTransportError(ctx, err),

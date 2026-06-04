@@ -128,7 +128,7 @@ Gateway 가 multi-vendor failover + per-key rate limit 까지 갖춘 v0.1.0-rc �
   - **조합 패턴 재사용** — `metrics.Multi(prom, log)` 가 fan-out 의 single source of truth. 별 `LogRecorder` 인터페이스 + 별 `LogMultiRecorder` 도입은 같은 패턴 두 번 작성 + caller 가 두 필드 (`Config.Metrics` + `Config.Logger`) 채우는 부담.
   - **인터페이스 시그니처 동일** — 둘 다 `OnAttempt(ctx, AttemptInfo)` / `OnFailover(ctx, FailoverInfo)` 로 충분. 추상화가 자연.
   - **인정된 비용** — `Config.Metrics` 에 `LogRecorder` 가 들어가면 독자가 "metric backend" 로 오독 가능. doc + 변수명 (`MetricRecorder` → 향후 `ObservabilityRecorder` rename 후보) 으로 완화. 본 ADR 의 trade-off 인정은 향후 인터페이스 분리 PR 이 별 ADR 없이 시도되지 않도록 trail 보존.
-  - 대안 (별 `LogRecorder` 인터페이스) 은 Alt 7 에서 검토.
+  - **검토된 대안**: `slog.Handler` 미들웨어 패턴으로 LogRecorder 자체를 우회 → Alt 7. 별도의 `LogRecorder` 인터페이스 (MetricRecorder 와 분리된 독립 추상화) → 본 ADR 에서 미채용 (`Config.Metrics` + `Config.Logger` 두 필드 부담 + `Multi` 패턴 중복 작성 비용 > 인터페이스 conflation 의 오독 비용).
 - **Maintainer note:** <!-- TODO: 본인 한 줄 voice 로 -->
 
 ### Q6. Distributed tracing (OpenTelemetry spans)
@@ -696,9 +696,9 @@ func (g *Gateway) Chat(ctx context.Context, req provider.ChatRequest) (provider.
 대안: `MetricRecorder` 를 구현하는 별 모듈 대신, gateway 가 attempt context (vendor / model / outcome 등) 를 ctx 에 push 하고 caller 가 등록한 custom `slog.Handler` wrapper 가 기존 모든 log record 에 attempt fields 를 자동 inject. Recorder 신설 없이 기존 slog pipeline 에 통합 가능 → "metric 과 log 를 같은 인터페이스에" 끼워맞추는 문제가 사라짐.
 
 **Reject 이유:**
-- gateway 내부가 모든 log call site 에 attempt context 를 주입할 수 없음 — recorder hook 은 attempt 단위 단일 발화 지점을 보장하지만, 미들웨어 패턴은 "어떤 log call 이 어떤 attempt 에 속하는지" 가 ctx span 에 묶임. ctx 가 멀티 goroutine 으로 fan-out 되면 attempt boundary 가 흐려짐.
-- caller 가 "내 기존 slog pipeline 에 gateway attempt 도 끼워 보내고 싶음" 이 아니라 "gateway 의 attempt 가 발생할 때마다 1 record" 가 표준 요구 — 미들웨어 패턴은 record 빈도가 caller 의 다른 log call 빈도에 의존하므로 attempt 단위 보장 불가.
-- 결과: 인터페이스 conflation 의 비용 (Q5 sub-decision) 을 받아들이는 게 attempt 단위 보장 + 패턴 단순성 측면에서 우위.
+- **단일 발화 지점 보장 불가** — recorder hook 은 gateway 가 `AttemptInfo` 를 구성한 직후 정확히 한 번 호출됨 (attempt 단위 1:1). 미들웨어 패턴은 caller 가 attempt 와 무관한 log call (예: 디버그 출력, 헬스체크) 을 해도 attempt fields 가 inject 되므로 attempt 단위 boundary 가 record 빈도에 매핑 안 됨. dashboard "vendor 별 attempt 수" 같은 baseline 질문조차 record count 로 답 불가.
+- **emission 책임의 위치** — 미들웨어는 caller 의 log pipeline 위에 얹는 방식. 그러면 "caller 가 log 안 쓰면 attempt trace 도 사라짐" — gateway 가 자기 record 의 발화 주체여야 (observability 정체성, ADR-001) 한다는 원칙 위반.
+- 결과: 인터페이스 conflation 의 비용 (Q5 sub-decision) 을 받아들이는 게 단일 발화 지점 보장 + 발화 책임 owner 측면에서 우위. (참고: AsyncWrapper + ctx staleness 문제는 본 ADR 의 선택지도 동일하게 받음 — Q6 Sub-decision + Open Questions 참고.)
 
 ### Alt 8 — Q6 OpenTelemetry Logs API (v0.2 후보)
 
@@ -741,7 +741,7 @@ OTel trace 를 v0.1 에 미룬 이유 (SDK 무거움) 는 타당하나, **OTel L
 | OTel adapter 가 나중에 ctx propagation 룰 충돌 | recorder hook 시그니처에 ctx 포함 → adapter 가 자체 span 추출 가능. 단 AsyncWrapper 통과 시 ctx 는 stale 가능 (Open Question 참고) |
 | `outcome` label 의 값 폭발 (vendor 가 새 error code 추가) | ErrorType 9개로 제한, 매핑되지 않으면 "error_unknown" |
 | AsyncWrapper Close() race 로 마지막 N event 손실 | CONTRACT 명시 — caller 의 graceful shutdown sequence 책임 (producer 중지 → in-flight 대기 → Close). 본 wrapper 는 zero-loss 보장 X |
-| **AsyncWrapper + LogRecorder 조합 시 log entry 손실** — metric drop (카운터 손실) 은 통계적으로 tolerable 하지만, log drop 은 post-mortem 의 attempt chain 구멍. 특히 error 경로 `slog.LevelWarn` 레코드 손실 시 사후 분석 불가. | 권장: 에러 포렌식이 critical 한 환경에서는 slow handler 라도 sync 유지 (Histogram 처럼 lock 경쟁만 신경) 또는 `DroppedEvents()` alert 구성 (`> 0` 이면 페이지). LogRecorder 전용 AsyncWrapper variant (drop 대신 blocking-with-timeout) 는 v0.2 후보. |
+| AsyncWrapper + LogRecorder 조합 시 log entry 손실 | metric drop (카운터 손실) 은 통계적으로 tolerable 하지만 log drop 은 post-mortem 의 attempt chain 구멍 — 특히 error 경로 `slog.LevelWarn` 레코드 손실 시 사후 분석 불가. 에러 포렌식이 critical 한 환경에서는 slow handler 라도 sync 유지 (Histogram 처럼 lock 경쟁만 신경) 또는 `DroppedEvents()` alert 구성 (`> 0` 이면 페이지). LogRecorder 전용 AsyncWrapper variant (drop 대신 blocking-with-timeout) 는 v0.2 후보. |
 | MultiRecorder 의 한 recorder 가 panic 하면 다른 recorder 도 호출 안 됨 | 개별 recover() 로 격리. Synthesis pseudocode 에 명시. 단 recorder 가 자체 goroutine spawn 후 panic 시는 못 잡음 (Risks 의 일반 recover 한계와 동일) |
 
 ---

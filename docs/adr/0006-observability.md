@@ -141,9 +141,9 @@ Gateway 가 multi-vendor failover + per-key rate limit 까지 갖춘 v0.1.0-rc �
   - 본 Recorder 인터페이스가 OnAttempt 콜백을 제공하므로, OTel adapter 가 별 모듈 (`pkg/metrics/otel`) 로 적층 가능 — 라이브러리 코어에 강제 의존성 X.
 - **왜 이 결정이 정당한가:** YAGNI. OTel 수요가 실제 발생할 때 별 ADR 로 도입 (v0.2 후보). 본 ADR 은 Recorder 추상화로 future-proof.
 - **Sub-decision (AsyncWrapper ↔ OTel ctx staleness):** AsyncWrapper 를 통한 ctx 는 consumer 가 꺼낼 때 cancelled 가능 — OTel 의 `trace.SpanFromContext(ctx)` 가 parent span 없는 상태. 두 가지 해결책 검토:
-  - **A. `AttemptInfo` 에 trace snapshot 필드** (`TraceID` / `SpanID` string) — gateway 가 OnAttempt 호출 직전 스냅샷. reject 사유: Q6 본 결정이 "v0.1 에 OTel 미포함" 인데 v0.1 의 AttemptInfo 에 OTel vocabulary 를 land 하는 건 YAGNI 자기모순. 실제 span 추출 로직 없으면 두 필드는 항상 빈 문자열 → dead weight. ADR-008 (OTel) 시점에 land 가 맞음.
-  - **B. AsyncWrapper + OTel 조합 사용 금지** ✅ — `AsyncWrapper` godoc 에 명시: "OTel / 기타 trace-context-coupled backend 와 함께 사용 금지 — ctx staleness 로 parent span 유실". OTel adapter 사용자는 sync 호출 (느린 backend 인 경우 자체 buffer 구현) 또는 ADR-008 에서 별 wrapper 도입.
-  - **선택: B.** Q6 의 YAGNI 결정과 일관. ADR-008 에서 OTel 도입 시 인터페이스에 trace snapshot 필드 추가 또는 별 ctx-preserving wrapper 도입 — 그 시점에 land.
+  - **A. `AttemptInfo` 에 trace snapshot 필드** (`TraceID` / `SpanID` string) — gateway 가 OnAttempt 호출 직전 스냅샷. reject 사유: Q6 본 결정이 "v0.1 에 OTel 미포함" 인데 v0.1 의 AttemptInfo 에 OTel vocabulary 를 land 하는 건 YAGNI 자기모순. 실제 span 추출 로직 없으면 두 필드는 항상 빈 문자열 → dead weight. ADR-009 (OTel) 시점에 land 가 맞음.
+  - **B. AsyncWrapper + OTel 조합 사용 금지** ✅ — `AsyncWrapper` godoc 에 명시: "OTel / 기타 trace-context-coupled backend 와 함께 사용 금지 — ctx staleness 로 parent span 유실". OTel adapter 사용자는 sync 호출 (느린 backend 인 경우 자체 buffer 구현) 또는 ADR-009 에서 별 wrapper 도입.
+  - **선택: B.** Q6 의 YAGNI 결정과 일관. ADR-009 에서 OTel 도입 시 인터페이스에 trace snapshot 필드 추가 또는 별 ctx-preserving wrapper 도입 — 그 시점에 land.
 - **Maintainer note:** <!-- TODO: 본인 한 줄 voice 로 -->
 
 ### Q7. Cardinality 폭발 방지
@@ -705,9 +705,9 @@ func (g *Gateway) Chat(ctx context.Context, req provider.ChatRequest) (provider.
 OTel trace 를 v0.1 에 미룬 이유 (SDK 무거움) 는 타당하나, **OTel Logs API** 는 metric 과 log 를 자연스럽게 분리하며 본 ADR 의 인터페이스 conflation 문제를 해결한다. caller 가 OTel collector 에 metric + log 둘 다 보내는 통합 운영 환경에서는 자연스러운 선택.
 
 **v0.1 reject 이유:**
-- OTel Logs SDK 도 trace 와 동일한 weight 부담 (별 ADR-008 OTel 시점에 일괄 land).
+- OTel Logs SDK 도 trace 와 동일한 weight 부담 (별 ADR-009 OTel 시점에 일괄 land).
 - `LogRecorder` 가 별 모듈이므로 OTel Logs adapter 도 같은 `MetricRecorder` 인터페이스 구현으로 future-proof — 본 ADR 의 추상화가 OTel Logs 채택을 막지 않음.
-- **v0.2 후보로 명시:** OTel Logs adapter (`pkg/metrics/otellog`) 추가 시 별 ADR-008 또는 OTel 통합 ADR 에서 결정. 본 ADR 의 인터페이스 분리 결정 (`LogRecorder` 별 모듈) 이 v0.2 OTel Logs 추가 부담을 줄임.
+- **v0.2 후보로 명시:** OTel Logs adapter (`pkg/metrics/otellog`) 추가 시 별 ADR-009 또는 OTel 통합 ADR 에서 결정. 본 ADR 의 인터페이스 분리 결정 (`LogRecorder` 별 모듈) 이 v0.2 OTel Logs 추가 부담을 줄임.
 
 ---
 
@@ -752,7 +752,7 @@ OTel trace 를 v0.1 에 미룬 이유 (SDK 무거움) 는 타당하나, **OTel L
 - [ADR-003](0003-model-routing-strategy.md) — 라우팅 실패 (no provider supports model) 의 origin=gateway-router 매핑
 - [ADR-004](0004-failover-trigger-and-retry.md) — Q5 의 미룬 attempt trace 형식 본 ADR 에서 land
 - [ADR-005](0005-distributed-rate-limit.md) — Q7 의 sentinel 통합과 metric origin 분리의 상호작용
-- **ADR-007 (예정)** — Cost attribution (per-key USD tracking). 본 ADR 의 `Usage.CostUSD` 가 입력.
+- **ADR-008 (예정)** — Cost attribution (per-key USD tracking). 본 ADR 의 `Usage.CostUSD` 가 입력. ADR-007 (streaming) 이 v0.2 의 더 큰 missing 기능으로 우선 land 되어 번호 재할당.
 
 ## Open Questions
 
@@ -765,4 +765,4 @@ OTel trace 를 v0.1 에 미룬 이유 (SDK 무거움) 는 타당하나, **OTel L
 - [ ] **1k RPS 임계치는 추정치** — Histogram lock 경쟁의 실제 임계치는 벤치마크 미실시 상태. v0.1 release 시 100/1k/10k RPS 측정으로 확정 또는 정정 예정. 측정 전까지는 운영자가 자체 부하 테스트로 검증 권장.
 - [ ] **AsyncWrapper ctx propagation 한계** — channel 에 담긴 ctx 는 consumer 가 꺼낼 때 이미 cancelled 일 수 있음. Prometheus counter / histogram 은 ctx 사용 X 이라 무해, 단 향후 OTel adapter 가 ctx 로 parent span 추출하면 span 유실. recording-only backend 는 context-agnostic 하게 구현 권장. OTel adapter 도입 시 별 ADR 에서 ctx propagation 룰 재검토.
 - [ ] `unknown_model_total` 이 PromRecorder 내부 detail — MultiRecorder(prom, logrecorder) 사용 시 log 측에는 unknown model 이벤트 전달 안 됨. 의도된 silent gap. log 에서도 unknown model 추적 필요한 사용자는 LogRecorder 가 자체 known-model set 보유해야 함 (PromRecorder 와 별도).
-- [ ] OpenTelemetry 도입 시기 — 본 ADR 의 v0.2 후보를 별 ADR-008 로 분리할지 본 ADR 의 Q6 확장으로 갈지
+- [ ] OpenTelemetry 도입 시기 — 본 ADR 의 v0.2 후보를 별 ADR-009 로 분리할지 본 ADR 의 Q6 확장으로 갈지

@@ -134,11 +134,10 @@ Gateway 가 multi-vendor failover + per-key rate limit 까지 갖춘 v0.1.0-rc �
   - 사용자가 OTel 안 쓰면 dead weight
   - 본 Recorder 인터페이스가 OnAttempt 콜백을 제공하므로, OTel adapter 가 별 모듈 (`pkg/metrics/otel`) 로 적층 가능 — 라이브러리 코어에 강제 의존성 X.
 - **왜 이 결정이 정당한가:** YAGNI. OTel 수요가 실제 발생할 때 별 ADR 로 도입 (v0.2 후보). 본 ADR 은 Recorder 추상화로 future-proof.
-- **Sub-decision (AsyncWrapper ↔ OTel ctx staleness):** AsyncWrapper 를 통한 ctx 는 consumer 가 꺼낼 때 cancelled 가능 — OTel 의 `trace.SpanFromContext(ctx)` 가 parent span 없는 상태. 두 가지 해결책 중 하나를 본 ADR 에서 land 해야 future OTel adapter 의 인터페이스 변경 회피:
-  - **A. `AttemptInfo` 에 trace snapshot 필드** (`TraceID`, `SpanID` string) 추가 — gateway 가 `OnAttempt` 호출 직전 ctx 에서 span ID 를 스냅샷해 info 에 채움. consumer 는 ctx 없이도 trace correlation 가능. 비용: AttemptInfo 가 OTel 의 trace 개념을 의미적으로 안다 (가벼운 leak).
-  - **B. AsyncWrapper + OTel 조합 사용 금지** — godoc 에 명시. OTel adapter 사용자는 sync 호출 또는 자체 wrapper 작성.
-  - **선택: A.** TraceID / SpanID 는 generic string 필드라 OTel 외 다른 trace 시스템 (Datadog APM, Jaeger 직접 등) 에서도 활용 가능. interface 안정성 확보. gateway 가 ctx 에 span 이 없으면 빈 문자열 — OTel 안 쓰는 사용자에게는 cost 0.
-  - 결과로 `AttemptInfo` 에 `TraceID string` + `SpanID string` 추가 (Synthesis 의 provider 패키지 참고).
+- **Sub-decision (AsyncWrapper ↔ OTel ctx staleness):** AsyncWrapper 를 통한 ctx 는 consumer 가 꺼낼 때 cancelled 가능 — OTel 의 `trace.SpanFromContext(ctx)` 가 parent span 없는 상태. 두 가지 해결책 검토:
+  - **A. `AttemptInfo` 에 trace snapshot 필드** (`TraceID` / `SpanID` string) — gateway 가 OnAttempt 호출 직전 스냅샷. reject 사유: Q6 본 결정이 "v0.1 에 OTel 미포함" 인데 v0.1 의 AttemptInfo 에 OTel vocabulary 를 land 하는 건 YAGNI 자기모순. 실제 span 추출 로직 없으면 두 필드는 항상 빈 문자열 → dead weight. ADR-008 (OTel) 시점에 land 가 맞음.
+  - **B. AsyncWrapper + OTel 조합 사용 금지** ✅ — `AsyncWrapper` godoc 에 명시: "OTel / 기타 trace-context-coupled backend 와 함께 사용 금지 — ctx staleness 로 parent span 유실". OTel adapter 사용자는 sync 호출 (느린 backend 인 경우 자체 buffer 구현) 또는 ADR-008 에서 별 wrapper 도입.
+  - **선택: B.** Q6 의 YAGNI 결정과 일관. ADR-008 에서 OTel 도입 시 인터페이스에 trace snapshot 필드 추가 또는 별 ctx-preserving wrapper 도입 — 그 시점에 land.
 - **Maintainer note:** <!-- TODO: 본인 한 줄 voice 로 -->
 
 ### Q7. Cardinality 폭발 방지
@@ -242,13 +241,6 @@ type AttemptInfo struct {
 	Duration time.Duration
 	Usage    Usage          // 성공 시
 	Error    *ProviderError // 실패 시
-
-	// Trace snapshot — Q6 의 AsyncWrapper ↔ OTel ctx staleness 해결책 A.
-	// gateway 가 OnAttempt 호출 직전 ctx 에서 span ID 스냅샷. AsyncWrapper 가
-	// consumer 에 보낼 때 ctx 는 cancelled 가능하지만 ID 는 unmodified.
-	// OTel 미사용 시 빈 문자열 — cost 0.
-	TraceID string
-	SpanID  string
 }
 
 type FailoverInfo struct {
@@ -317,8 +309,12 @@ type NoOpRecorder struct{}
 func (NoOpRecorder) OnAttempt(context.Context, provider.AttemptInfo)   {}
 func (NoOpRecorder) OnFailover(context.Context, provider.FailoverInfo) {}
 
-// 컴파일 타임 contract assertion.
-var _ MetricRecorder = NoOpRecorder{}
+// 컴파일 타임 contract assertion (NoOpRecorder + MultiRecorder + AsyncWrapper).
+var (
+	_ MetricRecorder = NoOpRecorder{}
+	_ MetricRecorder = MultiRecorder(nil)
+	_ MetricRecorder = (*AsyncWrapper)(nil)
+)
 
 // MultiRecorder 는 여러 recorder 를 합성 — caller 가 Prometheus + LoggingRecorder
 // 등 둘 다 받을 때 사용.
@@ -505,8 +501,18 @@ import "github.com/prometheus/client_golang/prometheus"
 func New() *PromRecorder { /* counter / histogram 등록 */ }
 
 func (r *PromRecorder) OnAttempt(ctx context.Context, info provider.AttemptInfo) {
-	r.requestsTotal.WithLabelValues(info.Vendor, info.Model, string(info.Outcome), string(info.Origin)).Inc()
-	r.attemptDuration.WithLabelValues(info.Vendor, info.Model, string(info.Outcome)).Observe(info.Duration.Seconds())
+	// Q7: known-model whitelist normalize. unknown 이면 별 counter 증가.
+	model := info.Model
+	if _, known := r.knownModels[model]; !known {
+		model = "unknown"
+		r.unknownModelTotal.WithLabelValues(info.Vendor).Inc()
+	}
+	r.requestsTotal.WithLabelValues(info.Vendor, model, string(info.Outcome), string(info.Origin)).Inc()
+	// pre-empt / router 경로는 Duration = 0 → histogram 오염 방지 위해 vendor origin
+	// 만 observe. attempt_duration_seconds 의 p50/p95/p99 가 0 으로 왜곡되는 걸 회피.
+	if info.Origin == types.OriginVendor {
+		r.attemptDuration.WithLabelValues(info.Vendor, model, string(info.Outcome)).Observe(info.Duration.Seconds())
+	}
 }
 
 func (r *PromRecorder) OnFailover(ctx context.Context, info provider.FailoverInfo) {

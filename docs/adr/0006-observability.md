@@ -150,8 +150,10 @@ Gateway 가 multi-vendor failover + per-key rate limit 까지 갖춘 v0.1.0-rc �
       - 정적 (build-time) — `gpt-4o`, `gpt-4o-mini` 같은 안정 family 는 어댑터에 하드코딩
       - 반-동적 — 어댑터 옵션 (`WithModels([]string)`) 으로 caller 가 등록. date-versioned ID (`gpt-4o-2024-11-20`) 는 caller 가 명시 등록 → redeploy 없이 추가 가능
     - **운영 가시성 보완**: `llm_gateway_unknown_model_total{vendor}` counter 로 unknown bucket 증가 추적. 비정상 증가 시 alert → 어댑터 옵션 추가하거나 어댑터 패치. ADR-001 의 "production-grade" 정체성과 충돌 방지.
-    - **발화 책임 (구현 위치):** `PromRecorder` (또는 일반 metric backend) 가 자체 known-model set 을 보유 — caller 가 `prom.New(prom.WithKnownModels([]string{"gpt-4o", "claude-opus-4-7", ...}))` 로 등록. `PromRecorder.OnAttempt` 안에서 `info.Model` 이 known set 에 있으면 그대로 label, 없으면 `model="unknown"` 으로 normalize + `unknown_model_total{vendor=info.Vendor}++`. 책임이 backend recorder 안에 모이고 gateway 는 raw model id 만 전달 — `AttemptInfo` 스키마 변경 없음, `MetricRecorder` 인터페이스 변경 없음.
-    - **Default whitelist:** `PromRecorder` 의 기본값은 **빈 set** — caller 가 `WithKnownModels` 옵션 없이 생성하면 모든 호출이 `model="unknown"` 으로 매핑됨 (의도된 default — caller 가 명시 등록할 때까지 cardinality 보호). 이는 "production 시작 시 alert 가 즉시 뜨는" 의도된 trade-off — 운영자가 model list 등록을 잊지 않게 함. 어댑터에 미리 알려진 model 을 hardcoded fallback 으로 두는 옵션도 가능 (`WithDefaultKnownModelsFromAdapters`) — v0.2 후보.
+    - **발화 책임 (gateway 레이어):** model normalize 는 **gateway 가 담당** — `Config.KnownModels []string` 옵션 (default empty) 으로 caller 가 화이트리스트 등록. `gateway.Chat` 이 AttemptInfo 를 만들 때 `info.Model` 이 known set 에 없으면 `"unknown"` 으로 normalize 후 recorder hook 호출. 결과: 모든 recorder (PromRecorder / LoggingRecorder / Multi) 가 **동일한 normalized model** 수신 — Q5 의 metric/log asymmetry 자동 해결.
+    - **`unknown_model_total` 발화:** PromRecorder.OnAttempt 에서 `info.Model == "unknown"` 일 때 `unknownModelTotal{vendor}++`. gateway 가 normalize 했으므로 PromRecorder 는 단순 check.
+    - **Default whitelist:** `Config.KnownModels` 의 기본값은 **빈 set** — 등록 안 하면 모든 호출이 `"unknown"` 매핑 (cardinality 보호 + 운영자에게 alert 즉시). 어댑터에 hardcoded fallback (`gateway.WithDefaultKnownModelsFromAdapters`) 옵션은 v0.2 후보.
+    - **이전 round 의 PromRecorder-내 whitelist 결정 reposition:** 초기 draft 는 PromRecorder.WithKnownModels 였음. critic 의 지적 (PromRecorder / LoggingRecorder asymmetry: log 측은 raw model 받음, metric 측은 normalize) 수용해 책임을 gateway 로 상향. recorder 인터페이스 변경 없음 (input data 만 일관).
     - **date-versioned model 의 운영 비용**: OpenAI 가 매월 새 model snapshot 출시 → 안 등록하면 silent unknown. 권장 운영 패턴: alert threshold = unknown_total 이 5분간 ≥ 100 → on-call 이 어댑터 옵션 추가하거나 model alias 확인.
   - `outcome` label — `success` 1개 + ErrorType 9개의 `error_<type>` (아래 enumeration) — 카디널리티 ≤ 10
     | outcome value | trigger |
@@ -458,13 +460,15 @@ import (
 	"github.com/thedev-junyoung/thedev-junyoung-go-llm-gateway/pkg/metrics"
 	"github.com/thedev-junyoung/thedev-junyoung-go-llm-gateway/pkg/provider"
 	"github.com/thedev-junyoung/thedev-junyoung-go-llm-gateway/pkg/ratelimit"
+	"github.com/thedev-junyoung/thedev-junyoung-go-llm-gateway/pkg/types"
 )
 
 // Config 확장 — non-breaking.
 type Config struct {
-	Providers []provider.Provider
-	RateLimit ratelimit.RateLimiter
-	Metrics   metrics.MetricRecorder // 새로 추가, nil 이면 New 가 NoOpRecorder{} 로 대체
+	Providers   []provider.Provider
+	RateLimit   ratelimit.RateLimiter
+	Metrics     metrics.MetricRecorder // 새로 추가, nil 이면 New 가 NoOpRecorder{} 로 대체
+	KnownModels []string               // 새로 추가, Q7 — recorder label 에 normalize. 빈 set 이면 모든 호출이 model="unknown"
 }
 
 func New(cfg Config) (*Gateway, error) {
@@ -472,7 +476,14 @@ func New(cfg Config) (*Gateway, error) {
 	if cfg.Metrics == nil {
 		cfg.Metrics = metrics.NoOpRecorder{}
 	}
-	return &Gateway{providers: cfg.Providers, rateLimit: cfg.RateLimit, metrics: cfg.Metrics}, nil
+	known := make(map[string]struct{}, len(cfg.KnownModels))
+	for _, m := range cfg.KnownModels {
+		known[m] = struct{}{}
+	}
+	return &Gateway{
+		providers: cfg.Providers, rateLimit: cfg.RateLimit, metrics: cfg.Metrics,
+		knownModels: known,
+	}, nil
 }
 ```
 
@@ -496,33 +507,51 @@ type ChatResponse struct {
 ```go
 package promrecorder
 
-import "github.com/prometheus/client_golang/prometheus"
+import (
+	"context"
+
+	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/thedev-junyoung/thedev-junyoung-go-llm-gateway/pkg/provider"
+	"github.com/thedev-junyoung/thedev-junyoung-go-llm-gateway/pkg/types"
+)
 
 func New() *PromRecorder { /* counter / histogram 등록 */ }
 
+// PromRecorder 는 gateway 가 이미 normalize 한 info.Model (unknown 처리 완료) 을
+// 받는다 — whitelist 책임은 gateway 레이어 (Q7 sub-decision 참고). PromRecorder 는
+// 순수 emit 책임만.
 func (r *PromRecorder) OnAttempt(ctx context.Context, info provider.AttemptInfo) {
-	// Q7: known-model whitelist normalize. unknown 이면 별 counter 증가.
-	model := info.Model
-	if _, known := r.knownModels[model]; !known {
-		model = "unknown"
+	r.requestsTotal.WithLabelValues(info.Vendor, info.Model, string(info.Outcome), string(info.Origin)).Inc()
+	if info.Model == "unknown" {
 		r.unknownModelTotal.WithLabelValues(info.Vendor).Inc()
 	}
-	r.requestsTotal.WithLabelValues(info.Vendor, model, string(info.Outcome), string(info.Origin)).Inc()
 	// pre-empt / router 경로는 Duration = 0 → histogram 오염 방지 위해 vendor origin
 	// 만 observe. attempt_duration_seconds 의 p50/p95/p99 가 0 으로 왜곡되는 걸 회피.
 	if info.Origin == types.OriginVendor {
-		r.attemptDuration.WithLabelValues(info.Vendor, model, string(info.Outcome)).Observe(info.Duration.Seconds())
+		r.attemptDuration.WithLabelValues(info.Vendor, info.Model, string(info.Outcome)).Observe(info.Duration.Seconds())
 	}
 }
 
 func (r *PromRecorder) OnFailover(ctx context.Context, info provider.FailoverInfo) {
-	r.failoversTotal.WithLabelValues(info.FromVendor, info.ToVendor, string(info.Reason)).Inc()
+	// reason label 을 outcome 과 동일 포맷 ("error_<type>") 으로 normalize — dashboard
+	// 의 cross-query (failovers_total.reason vs requests_total.outcome) 정합.
+	r.failoversTotal.WithLabelValues(info.FromVendor, info.ToVendor, "error_"+string(info.Reason)).Inc()
 }
 ```
 
 **gateway.Chat 통합:**
 
 ```go
+// normalizeModel 은 Config.KnownModels 화이트리스트 기준으로 model id 를 normalize.
+// 등록 안 된 model 은 "unknown" — recorder 가 일관된 값을 받음 (Q7 sub-decision).
+func (g *Gateway) normalizeModel(model string) string {
+	if _, known := g.knownModels[model]; known {
+		return model
+	}
+	return "unknown"
+}
+
 // recordAttempt / recordFailover 는 recorder panic 격리 (Risks 표). 두 hook 모두
 // 같은 패턴으로 처리 — 한쪽만 보호하면 OnFailover panic 시 Chat 전체가 crash.
 func (g *Gateway) recordAttempt(ctx context.Context, info provider.AttemptInfo) {
@@ -549,8 +578,11 @@ func (g *Gateway) Chat(ctx context.Context, req provider.ChatRequest) (provider.
 	if err != nil {
 		// origin=gateway-router. Vendor 가 없으므로 빈 문자열, AttemptN=0.
 		g.recordAttempt(ctx, provider.AttemptInfo{
-			Model: req.Model, Outcome: provider.OutcomeFromErr(err),
-			Origin: types.OriginGatewayRouter, Error: asProviderError(err),
+			Vendor:  "gateway", // router 실패 — vendor 는 gateway 자체 (router 가 *ProviderError{Vendor:"gateway"} 반환과 일관)
+			Model:   g.normalizeModel(req.Model),
+			Outcome: provider.OutcomeFromErr(err),
+			Origin:  types.OriginGatewayRouter,
+			Error:   asProviderError(err),
 		})
 		return provider.ChatResponse{}, err
 	}

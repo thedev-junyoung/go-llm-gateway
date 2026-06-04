@@ -51,9 +51,13 @@ func New() *PromRecorder {
 }
 
 // NewWithRegisterer registers the metric vectors against reg and returns
-// the recorder. reg must be non-nil — a nil Registerer would silently
-// discard every emission downstream and is almost certainly a wiring bug.
+// the recorder. reg must be non-nil — a nil Registerer would panic at
+// MustRegister anyway; we catch it explicitly so the error message points
+// at the wiring mistake instead of a deep stack into client_golang.
 func NewWithRegisterer(reg prometheus.Registerer) *PromRecorder {
+	if reg == nil {
+		panic("promrecorder: NewWithRegisterer called with nil Registerer")
+	}
 	r := &PromRecorder{
 		requestsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: metricRequestsTotal,

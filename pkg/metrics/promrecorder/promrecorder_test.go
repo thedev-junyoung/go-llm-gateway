@@ -34,11 +34,20 @@ func TestOnAttempt_VendorSuccess_IncrementsRequestsAndObservesDuration(t *testin
 		Duration: 250 * time.Millisecond,
 	})
 
-	if got := testutil.CollectAndCount(reg, "llm_gateway_requests_total"); got != 1 {
-		t.Errorf("requests_total series count = %d, want 1", got)
+	// Pin the full label set with GatherAndCompare so a label rename or
+	// reorder fails loudly — CollectAndCount only catches series-count drift.
+	const wantRequests = `
+# HELP llm_gateway_requests_total Total number of Chat attempts the gateway observed, partitioned by vendor, model, outcome, and origin (vendor / gateway-preempt / gateway-router).
+# TYPE llm_gateway_requests_total counter
+llm_gateway_requests_total{model="gpt-4o",origin="vendor",outcome="success",vendor="openai"} 1
+`
+	if err := testutil.GatherAndCompare(reg, strings.NewReader(wantRequests), "llm_gateway_requests_total"); err != nil {
+		t.Errorf("requests_total exposition mismatch: %v", err)
 	}
-	// Histogram has _bucket / _sum / _count series — _count is the canonical
-	// "did we observe?" signal.
+
+	// Histogram series count is the cleanest "did we observe?" check —
+	// GatherAndCompare on the histogram would have to enumerate every
+	// bucket boundary which is brittle to the bucket-list constant.
 	if got := testutil.CollectAndCount(reg, "llm_gateway_attempt_duration_seconds"); got == 0 {
 		t.Errorf("attempt_duration_seconds was not observed for vendor-origin attempt")
 	}

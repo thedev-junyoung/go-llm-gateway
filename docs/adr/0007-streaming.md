@@ -288,7 +288,7 @@ func (g *Gateway) ChatStream(ctx context.Context, req provider.ChatRequest) (<-c
 //         for ch := range in {  // closes when adapter closes
 //             if !firstTokenSeen && ch.ContentDelta != "" {
 //                 firstTokenSeen = true
-//                 g.metrics.ObserveFirstTokenLatency(p.Name(), info.Model,
+//                 g.metrics.ObserveFirstTokenLatency(p.Name(), normalizedModel(req),
 //                     "success", time.Since(attemptStart))
 //             }
 //             out <- ch
@@ -301,11 +301,11 @@ func (g *Gateway) ChatStream(ctx context.Context, req provider.ChatRequest) (<-c
 //             if ctx.Err() != nil {
 //                 outcome = "ctx_cancel_before_first_chunk"
 //             }
-//             g.metrics.ObserveFirstTokenLatency(p.Name(), info.Model,
+//             g.metrics.ObserveFirstTokenLatency(p.Name(), normalizedModel(req),
 //                 outcome, time.Since(attemptStart))
 //         }
 //         outcome := outcomeFromChunk(lastChunk)  // success / error_*
-//         g.metrics.ObserveStreamDuration(p.Name(), info.Model, outcome,
+//         g.metrics.ObserveStreamDuration(p.Name(), normalizedModel(req), outcome,
 //             time.Since(attemptStart))
 //     }()
 //     return out
@@ -383,7 +383,7 @@ vendor A 가 fail 하면 받은 partial 을 buffer 에 저장, vendor B 로 새 
 
 ## Open Questions
 
-- [ ] Tool calling 의 delta 정규화 — ADR-007 v1 은 ContentDelta (text) 만. tool_use delta 는 Raw 에 통과. v0.2.x 또는 ADR-009 에서 typed tool calling 결정 시 같이.
+- [ ] Tool calling 의 delta 정규화 — ADR-007 v1 은 ContentDelta (text) 만. tool_use delta 는 Raw 에 통과. v0.2.x 또는 별 ADR (typed tool calling) 에서 결정 시 같이. ADR-009 (OTel) 와 슬롯 충돌 회피 — typed tool calling 슬롯은 maintainer 가 우선순위 결정 시점에 할당.
 - [ ] Multi-modal (image / audio) chunk 정규화 — text 만 다룸. v0.2.x.
 - [ ] Streaming-aware rate limit — TPM 측정이 사후 (전체 stream 끝나야 OutputTokens 확정). RPM 은 entry-time, TPM 은 stream-end-time reconcile. ADR-005 의 RPM/TPM 분리 결정이 streaming 에 그대로 적용되는지 v0.2 구현 시점 검증.
 - [ ] `gateway.HasStreamingFor(model)` helper — caller 가 streaming 지원 vendor 사전 확인. v0.3 후보.

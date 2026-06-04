@@ -9,7 +9,9 @@
 
 ## Context
 
-v0.1 (ADR-001~006) 는 synchronous `Chat(ctx, req) → (ChatResponse, error)` 만 지원. 모든 LLM gateway 의 #1 요청 기능은 **streaming** — 토큰이 하나씩 도착할 때 caller 의 UI 가 typewriter 효과를 줄 수 있어야 함. LiteLLM / Portkey / Helicone 모두 streaming 이 baseline.
+**왜 지금 (v0.2 시작 시점)**: v0.1 (ADR-001~006) 가 main 에 안정 land 한 직후, ship 전 확정해야 할 단일 가장 큰 missing 기능이 streaming. 경쟁 라이브러리 (LiteLLM / Portkey / Helicone) 가 모두 baseline 으로 streaming 제공 → 사용자 evaluation 의 first-glance 결격 사유. v0.1.0-rc 릴리스 후 첫 GitHub issue / discussion 이 거의 확정적으로 streaming 요청이 될 것이므로, RC baking 동안 ADR 결정만 land 시켜 implementation 시리즈를 짧은 turn-around 로 시작.
+
+v0.1 (ADR-001~006) 는 synchronous `Chat(ctx, req) → (ChatResponse, error)` 만 지원. 모든 LLM gateway 의 #1 요청 기능은 **streaming** — 토큰이 하나씩 도착할 때 caller 의 UI 가 typewriter 효과를 줄 수 있어야 함.
 
 영향 모듈:
 
@@ -68,28 +70,14 @@ v0.1 (ADR-001~006) 는 synchronous `Chat(ctx, req) → (ChatResponse, error)` �
 
 ### Q3. StreamChunk shape
 
-- **Decision:** **delta-based + 마지막 chunk 에 final metadata (Usage / FinishReason)**.
+- **Decision:** **delta-based + 마지막 chunk 에 final metadata (Usage / FinishReason)**. 종료 시그널은 channel close 가 아닌 `FinishReason` (정상) 또는 `Err` (mid-stream 실패, Q7).
   ```go
   type StreamChunk struct {
-      // ContentDelta is the incremental text token(s) for this chunk.
-      // Empty on metadata-only chunks (first chunk with role, last chunk
-      // with usage). Concatenating ContentDelta across all chunks yields
-      // the same string ChatResponse.Content would return.
-      ContentDelta string
-
-      // FinishReason is non-empty only on the terminal chunk. Use this
-      // (not channel close) to detect normal end-of-stream — channel close
-      // can also mean ctx cancellation.
-      FinishReason provider.FinishReason
-
-      // Usage is populated only on the terminal chunk. Gemini and
-      // Anthropic emit it inline; OpenAI requires stream_options.
-      // include_usage=true (the adapter sets it automatically).
-      Usage provider.Usage
-
-      // Raw is the original vendor event JSON for advanced callers
-      // (tool_use delta, multi-modal blocks). Mirrors ChatResponse.Raw.
-      Raw json.RawMessage
+      ContentDelta string                // incremental text; empty on metadata-only chunks
+      FinishReason provider.FinishReason // non-empty only on the terminal chunk
+      Usage        provider.Usage        // populated only on the terminal chunk
+      Raw          json.RawMessage       // original vendor event JSON, mirrors ChatResponse.Raw
+      Err          error                 // non-nil only on the terminal chunk for mid-stream failures — see Q7
   }
   ```
 - **Agent reasoning:** Three options compared:
@@ -108,17 +96,21 @@ v0.1 (ADR-001~006) 는 synchronous `Chat(ctx, req) → (ChatResponse, error)` �
   - **partial-output rollback**: caller 가 받은 chunk 를 "취소" 하는 메커니즘이 protocol 에 없음. 일부 vendor 는 cumulative=true 옵션 있지만 표준 X.
   - **결정 근거**: streaming 의 본질은 "early commitment to a token stream". 그 commitment 가 깨지면 caller 에게 노출하는 게 최선. mid-stream error chunk 는 Q7 에서 정의.
 - **왜 이 결정이 정당한가:** UX 가 protocol 보다 우선. mid-stream failover 가 가능해 보여도 caller 가 받는 텍스트가 inconsistent 면 무의미. ADR-004 의 "no in-provider retry" 원칙과 일관 — early commitment 의 단방향성.
+- **Sub-decision (non-typewriter caller 의 counter-case 인정):** gateway 는 general-purpose 라이브러리이므로 streaming 소비자가 typewriter UI 만은 아님. internal LLM chaining pipeline / batch transformer / RAG context streaming 같은 caller 는 mid-stream chunk 가 다른 vendor 로 점프해도 UX 가 안 깨짐 (사람이 안 봄). 이 counter-case 를 인지하나 **여전히 reject** 하는 이유:
+  - (1) gateway 가 caller 의 use case (typewriter vs pipeline) 를 protocol 단에서 구분 불가. caller 가 "나는 pipeline 이니 mid-stream failover OK" 를 flag 로 알려야 하는 옵션이 필요한데, 그건 API surface 추가 (`ChatStreamOptions{AllowMidStreamFailover bool}`) → 단순함 손실.
+  - (2) Q3 의 delta-based 정규화는 vendor 간 token boundary 가 다름 (예: OpenAI 가 `"hello"` 한 토큰, Anthropic 이 `"hel"` + `"lo"` 두 청크). pipeline caller 도 이 boundary mismatch 를 자체 처리해야 함 → gateway 가 책임지지 않는 게 일관.
+  - (3) v0.2 시점에 pipeline use case 의 실수요가 검증 안 됨. 등장하면 별 ADR 에서 opt-in option 추가.
 - **Maintainer note:** <!-- TODO: 본인 한 줄 voice 로 -->
 
 ### Q5. Streaming 메트릭
 
 - **Decision:** **두 신규 metric + 기존 metric 의미 보존**:
-  - `llm_gateway_first_token_latency_seconds{vendor, model}` (histogram) — `ChatStream` 호출부터 첫 `ContentDelta!=""` chunk 까지. 운영자의 "perceived responsiveness" 지표.
+  - `llm_gateway_first_token_latency_seconds{vendor, model, outcome}` (histogram) — `ChatStream` 호출부터 첫 `ContentDelta!=""` chunk 까지. 운영자의 "perceived responsiveness" 지표. `outcome` 라벨로 정상 첫 chunk 도달 / pre-stream 실패 / 첫 chunk 전 ctx cancel 구분.
   - `llm_gateway_stream_duration_seconds{vendor, model, outcome}` (histogram) — `ChatStream` 호출부터 stream close 까지 전체. 첫 chunk 못 받고 종료된 경우 (pre-stream 실패) 는 Origin=vendor 의 `attempt_duration_seconds` 와 동일 의미.
 - **Agent reasoning:**
   - **TTFT 중요성**: user-facing UX 의 single most important LLM 메트릭. p50 < 500ms 가 product standard. 없으면 vendor latency 회귀를 dashboard 에서 못 잡음.
   - **stream_duration vs attempt_duration**: 둘 다 histogram, label 다름. ADR-006 의 `attempt_duration_seconds` 는 sync Chat 의 단일 RTT — streaming 의 의미와 다름. 분리 metric 으로 의미 보존.
-  - **Cardinality**: TTFT histogram 라벨 = `vendor + model + outcome`. ADR-006 Q7 의 cap (model whitelist) 그대로 적용. 추가 cardinality 비용 없음.
+  - **Cardinality**: 두 histogram 의 라벨 셋 동일 = `vendor + model + outcome` (총 3 labels). `model` 은 ADR-006 Q7 의 `KnownModels` whitelist normalization 동일 적용 — 미등록 model 은 `"unknown"` 으로 fallback. PromRecorder 의 `llm_gateway_unknown_model_total` 도 streaming 경로에서 동일하게 증가.
 - **Sub-decision (sync Chat 의 attempt_duration_seconds 와 통합 옵션):** reject. streaming 과 sync 의 의미 단위가 다름 (sync = 1 RTT, stream = stream lifecycle). 같은 metric 에 두 단위가 섞이면 p99 해석 모호.
 - **Maintainer note:** <!-- TODO: 본인 한 줄 voice 로 -->
 
@@ -248,23 +240,61 @@ func (g *Gateway) ChatStream(ctx context.Context, req provider.ChatRequest) (<-c
     for i, p := range candidates {
         sp, ok := p.(provider.StreamingProvider)
         if !ok {
-            // Provider 인터페이스 만 구현. streaming 미지원 → skip (router 가
-            // 이걸 사전에 filter 하는 게 더 깔끔하지만 v0.2.0 시점에 결정).
-            continue
+            continue // streaming 미지원 candidate skip
         }
         // Rate-limit pre-check + ctx check (Chat 과 동일)
         stream, err := sp.ChatStream(ctx, req)
         if err == nil {
-            // 첫 chunk 받기 전. Metrics: TTFT histogram 은 첫 ContentDelta!="" 시점에 Observe.
-            // 이건 wrapper goroutine 으로 intercept.
+            // 첫 chunk 받기 전. Metrics: TTFT histogram 은 첫 ContentDelta!=""
+            // 시점에 Observe. wrapper goroutine 으로 intercept (아래 sketch).
             return wrapWithMetrics(g, p, i, stream), nil
         }
         lastErr = err
         if !shouldFailover(err) { return nil, err }
         // recordFailover (ADR-006) — pre-stream 이므로 동일 패턴.
     }
+
+    // candidates 전원이 streaming 미지원 + lastErr == nil 인 케이스 가드. nil
+    // channel 을 반환하면 caller 의 range 가 영구 block 됨. router 와 동일한
+    // ErrorType (InvalidInput) + Vendor="gateway" 로 합성 ProviderError 반환.
+    if lastErr == nil {
+        return nil, provider.NewProviderError("gateway",
+            provider.ErrorTypeInvalidInput, 0, false,
+            fmt.Sprintf("no streaming provider supports model %q", req.Model), nil)
+    }
     return nil, lastErr
 }
+
+// wrapWithMetrics intercepts the chunk stream to (1) start the TTFT
+// timer on entry, (2) Observe the first-token-latency histogram when
+// the first ContentDelta!="" arrives, (3) Observe the stream_duration
+// histogram on channel close. Adds one relay goroutine + two timestamps
+// over the stream lifetime; per-chunk hop cost measured during the
+// implementation PR (wrapWithMetrics) and pinned in README.
+//
+// func wrapWithMetrics(g *Gateway, p provider.Provider, attemptN int,
+//                      in <-chan provider.StreamChunk) <-chan provider.StreamChunk {
+//     out := make(chan provider.StreamChunk, cap(in))
+//     go func() {
+//         defer close(out)
+//         start := time.Now()
+//         firstTokenSeen := false
+//         var lastChunk provider.StreamChunk
+//         for ch := range in {  // closes when adapter closes
+//             if !firstTokenSeen && ch.ContentDelta != "" {
+//                 firstTokenSeen = true
+//                 g.metrics.ObserveFirstTokenLatency(p.Name(), info.Model,
+//                     "success", time.Since(start))
+//             }
+//             out <- ch
+//             lastChunk = ch
+//         }
+//         outcome := outcomeFromChunk(lastChunk)  // success / error_*
+//         g.metrics.ObserveStreamDuration(p.Name(), info.Model, outcome,
+//             time.Since(start))
+//     }()
+//     return out
+// }
 ```
 
 ---
@@ -288,7 +318,7 @@ func (g *Gateway) ChatStream(ctx context.Context, req provider.ChatRequest) (<-c
 
 | Risk | Mitigation |
 |---|---|
-| Caller 가 channel 을 끝까지 안 읽고 goroutine 만 종료 (gw goroutine leak) | producer goroutine 이 ctx.Done() 감지 → return. caller 는 ctx cancel 책임. 미문서화 시 leak. |
+| Caller 가 channel 을 끝까지 안 읽고 goroutine 만 종료 (gw goroutine leak) | producer goroutine 은 `<-ctx.Done()` 도 select 에서 감시 → caller 가 ctx 만 cancel 하면 leak 없음. 문제는 caller 가 `for chunk := range stream { break }` 로 ctx cancel 없이 빠져나가는 경우: producer 가 buffered channel 에 send 시도하다 buffer 차면 block, ctx 만료까지 살아있음. **Mitigation**: `ChatStream` godoc 에 명시 — "caller MUST defer cancel() the ctx passed to ChatStream; range loop 만 빠져나가는 패턴은 producer leak". `examples/streaming` 에 `ctx, cancel := ...; defer cancel()` 패턴 보이고 godoc 에서 같은 패턴 강제. |
 | Mid-stream 5xx event 가 vendor 에 따라 다른 wire 표현 | adapter 별 mapSSEError 로 격리. Q7 의 `Err` 필드가 단일 caller 인터페이스. |
 | TTFT 측정의 wrapper 추가가 overhead | wrapper goroutine 1개 추가, channel forward — 1-2 ns 수준. 벤치마크로 검증 후 README 인용. |
 | Gemini 의 `streamGenerateContent` 가 SSE 아닌 JSON-line | adapter 가 line-based parsing 추가 (SSE 와 약간 다른 분기). 같은 StreamChunk 로 정규화. |

@@ -118,7 +118,14 @@ func TestStreamChunk_RawMarshalsRoundtrip(t *testing.T) {
 func TestStreamChunk_ErrField_ProviderErrorCompatible(t *testing.T) {
 	t.Parallel()
 	pe := provider.NewProviderError("openai", provider.ErrorTypeRateLimit, 429, true, "throttled", nil)
-	c := provider.StreamChunk{Err: pe}
+	// FinishReason MUST be FinishUnknown when Err is non-nil per the
+	// godoc contract — building the test fixture the same way an
+	// adapter would catches a future drift where a producer forgets
+	// to set the field.
+	c := provider.StreamChunk{
+		FinishReason: provider.FinishUnknown,
+		Err:          pe,
+	}
 
 	if !errors.Is(c.Err, provider.ErrRateLimited) {
 		t.Error("errors.Is(chunk.Err, ErrRateLimited) = false, want true")

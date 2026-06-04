@@ -91,6 +91,15 @@ func TestOnAttempt_RouterOrigin_SkipsHistogram(t *testing.T) {
 	if got := testutil.CollectAndCount(reg, "llm_gateway_attempt_duration_seconds"); got != 0 {
 		t.Errorf("attempt_duration_seconds = %d, want 0 (router-failure MUST NOT pollute the histogram)", got)
 	}
+	// unknown_model_total is origin-agnostic per ADR-006 Q7 pseudocode —
+	// router-origin attempts with Model=="unknown" still increment the
+	// alert counter (the vendor label exposes them as vendor="gateway"
+	// so dashboards can filter them out if router noise dominates the
+	// signal). Pin that behavior here so a future origin-gating refactor
+	// fails loudly instead of silently muting the gateway-vendor stream.
+	if got := testutil.CollectAndCount(reg, "llm_gateway_unknown_model_total"); got != 1 {
+		t.Errorf("unknown_model_total series = %d, want 1 (origin-agnostic counter)", got)
+	}
 }
 
 // TestOnAttempt_UnknownModel_IncrementsUnknownTotal pins the alert signal:

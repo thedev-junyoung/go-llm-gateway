@@ -81,8 +81,8 @@ func TestOnAttempt_Success_EmitsInfoWithAllFields(t *testing.T) {
 	if rec.Level != slog.LevelInfo {
 		t.Errorf("Level = %v, want Info on success", rec.Level)
 	}
-	if rec.Message != "gateway attempt" {
-		t.Errorf("Message = %q, want %q", rec.Message, "gateway attempt")
+	if rec.Message != logrecorder.MsgAttempt {
+		t.Errorf("Message = %q, want %q", rec.Message, logrecorder.MsgAttempt)
 	}
 
 	attrs := attrMap(rec)
@@ -182,8 +182,8 @@ func TestOnFailover_EmitsInfoWithFailoverFields(t *testing.T) {
 	if rec.Level != slog.LevelInfo {
 		t.Errorf("Level = %v, want Info (failover is procedural)", rec.Level)
 	}
-	if rec.Message != "gateway failover" {
-		t.Errorf("Message = %q, want %q", rec.Message, "gateway failover")
+	if rec.Message != logrecorder.MsgFailover {
+		t.Errorf("Message = %q, want %q", rec.Message, logrecorder.MsgFailover)
 	}
 
 	attrs := attrMap(rec)
@@ -213,6 +213,26 @@ func TestOnAttempt_NoRequestID_EmptyString(t *testing.T) {
 		Model:   "gpt-4o",
 		Outcome: types.OutcomeSuccess,
 		Origin:  types.OriginVendor,
+	})
+
+	attrs := attrMap(h.snapshot()[0])
+	if attrs["request_id"] != "" {
+		t.Errorf("request_id = %v, want empty string when ctx has none", attrs["request_id"])
+	}
+}
+
+// TestOnFailover_NoRequestID_EmptyString mirrors the attempt-side guard.
+// OnFailover also pulls request_id from ctx; missing it must surface the
+// same empty-string shape so the two record types stay filter-symmetric
+// in log aggregators.
+func TestOnFailover_NoRequestID_EmptyString(t *testing.T) {
+	t.Parallel()
+
+	r, h := newRecorderWithCapture(t)
+	r.OnFailover(context.Background(), provider.FailoverInfo{
+		FromVendor: "openai",
+		ToVendor:   "anthropic",
+		Reason:     provider.ErrorTypeRateLimit,
 	})
 
 	attrs := attrMap(h.snapshot()[0])

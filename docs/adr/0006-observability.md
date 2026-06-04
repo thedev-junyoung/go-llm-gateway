@@ -113,9 +113,9 @@ Gateway 가 multi-vendor failover + per-key rate limit 까지 갖춘 v0.1.0-rc �
 
 ### Q5. Structured logging 표준
 
-- **Decision:** **`log/slog` 표준 필드 명세 + 분리된 `LoggingRecorder` 모듈**.
+- **Decision:** **`log/slog` 표준 필드 명세 + 분리된 `LogRecorder` 모듈**.
   - 표준 필드: `request_id`, `vendor`, `model`, `attempt`, `outcome`, `duration_ms`, `origin`
-  - `LoggingRecorder` (별 모듈, `pkg/metrics/logrecorder`) 는 `MetricRecorder` 인터페이스 구현체로, OnAttempt 마다 위 필드로 `slog.Info` / `slog.Warn` emit
+  - `LogRecorder` (별 모듈, `pkg/metrics/logrecorder`) 는 `MetricRecorder` 인터페이스 구현체로, OnAttempt 마다 위 필드로 `slog.Info` / `slog.Warn` emit
   - **MetricRecorder 자체는 slog 책임 없음** — 사용자가 metric 만 / log 만 / 둘 다 자유롭게 조합. MultiRecorder 로 합성 가능 (`metrics.Multi(promRecorder, logrecorder.New())`)
 - **Agent reasoning:** 초기 draft 는 OnAttempt 가 slog 도 emit 하는 책임 결합. 그러면 `Config.Metrics = nil` (NoOpRecorder) 사용자는 metric 도 log 도 둘 다 잃음 — log-only 사용 케이스 불가. 책임 분리 후:
   - Metric 만: `prom.New()`
@@ -150,10 +150,10 @@ Gateway 가 multi-vendor failover + per-key rate limit 까지 갖춘 v0.1.0-rc �
       - 정적 (build-time) — `gpt-4o`, `gpt-4o-mini` 같은 안정 family 는 어댑터에 하드코딩
       - 반-동적 — 어댑터 옵션 (`WithModels([]string)`) 으로 caller 가 등록. date-versioned ID (`gpt-4o-2024-11-20`) 는 caller 가 명시 등록 → redeploy 없이 추가 가능
     - **운영 가시성 보완**: `llm_gateway_unknown_model_total{vendor}` counter 로 unknown bucket 증가 추적. 비정상 증가 시 alert → 어댑터 옵션 추가하거나 어댑터 패치. ADR-001 의 "production-grade" 정체성과 충돌 방지.
-    - **발화 책임 (gateway 레이어):** model normalize 는 **gateway 가 담당** — `Config.KnownModels []string` 옵션 (default empty) 으로 caller 가 화이트리스트 등록. `gateway.Chat` 이 AttemptInfo 를 만들 때 `info.Model` 이 known set 에 없으면 `"unknown"` 으로 normalize 후 recorder hook 호출. 결과: 모든 recorder (PromRecorder / LoggingRecorder / Multi) 가 **동일한 normalized model** 수신 — Q5 의 metric/log asymmetry 자동 해결.
+    - **발화 책임 (gateway 레이어):** model normalize 는 **gateway 가 담당** — `Config.KnownModels []string` 옵션 (default empty) 으로 caller 가 화이트리스트 등록. `gateway.Chat` 이 AttemptInfo 를 만들 때 `info.Model` 이 known set 에 없으면 `"unknown"` 으로 normalize 후 recorder hook 호출. 결과: 모든 recorder (PromRecorder / LogRecorder / Multi) 가 **동일한 normalized model** 수신 — Q5 의 metric/log asymmetry 자동 해결.
     - **`unknown_model_total` 발화:** PromRecorder.OnAttempt 에서 `info.Model == "unknown"` 일 때 `unknownModelTotal{vendor}++`. gateway 가 normalize 했으므로 PromRecorder 는 단순 check.
     - **Default whitelist:** `Config.KnownModels` 의 기본값은 **빈 set** — 등록 안 하면 모든 호출이 `"unknown"` 매핑 (cardinality 보호 + 운영자에게 alert 즉시). 어댑터에 hardcoded fallback (`gateway.WithDefaultKnownModelsFromAdapters`) 옵션은 v0.2 후보.
-    - **이전 round 의 PromRecorder-내 whitelist 결정 reposition:** 초기 draft 는 PromRecorder.WithKnownModels 였음. critic 의 지적 (PromRecorder / LoggingRecorder asymmetry: log 측은 raw model 받음, metric 측은 normalize) 수용해 책임을 gateway 로 상향. recorder 인터페이스 변경 없음 (input data 만 일관).
+    - **이전 round 의 PromRecorder-내 whitelist 결정 reposition:** 초기 draft 는 PromRecorder.WithKnownModels 였음. critic 의 지적 (PromRecorder / LogRecorder asymmetry: log 측은 raw model 받음, metric 측은 normalize) 수용해 책임을 gateway 로 상향. recorder 인터페이스 변경 없음 (input data 만 일관).
     - **date-versioned model 의 운영 비용**: OpenAI 가 매월 새 model snapshot 출시 → 안 등록하면 silent unknown. 권장 운영 패턴: alert threshold = unknown_total 이 5분간 ≥ 100 → on-call 이 어댑터 옵션 추가하거나 model alias 확인.
   - `outcome` label — `success` 1개 + ErrorType 9개의 `error_<type>` (아래 enumeration) — 카디널리티 ≤ 10
     | outcome value | trigger |
@@ -318,7 +318,7 @@ var (
 	_ MetricRecorder = (*AsyncWrapper)(nil)
 )
 
-// MultiRecorder 는 여러 recorder 를 합성 — caller 가 Prometheus + LoggingRecorder
+// MultiRecorder 는 여러 recorder 를 합성 — caller 가 Prometheus + LogRecorder
 // 등 둘 다 받을 때 사용.
 type MultiRecorder []MetricRecorder
 
@@ -733,10 +733,10 @@ func (g *Gateway) Chat(ctx context.Context, req provider.ChatRequest) (provider.
 - [x] **(해결됨)** rate limit backend 에러 시 origin — Q3 Sub-decision 에서 `vendor` 로 결정 (FailOpen path 가 vendor 호출로 이어지므로).
 - [ ] Recorder 의 ctx propagation 룰 — OTel adapter 가 등장하면 본 ADR 의 ctx 시그니처가 충분한지 재검토
 - [ ] Metric naming convention — Prometheus 의 `_total` / `_seconds` suffix 외에 다른 명명 규칙 (예: `_count`) 필요한지
-- [x] **(결정됨)** Log sampling 은 본 ADR 에서 미룸 — `LoggingRecorder` 가 별 모듈이므로 caller 가 자체 sampling 로직을 wrapping 가능 (예: `SampledRecorder` 를 직접 구현하거나 slog handler 의 sampling 사용). v0.2 에서 `SampledRecorder` 표준 wrapper 도입 여부는 별 ADR. 본 ADR 의 결정: gateway core 는 sampling 책임 없음.
+- [x] **(결정됨)** Log sampling 은 본 ADR 에서 미룸 — `LogRecorder` 가 별 모듈이므로 caller 가 자체 sampling 로직을 wrapping 가능 (예: `SampledRecorder` 를 직접 구현하거나 slog handler 의 sampling 사용). v0.2 에서 `SampledRecorder` 표준 wrapper 도입 여부는 별 ADR. 본 ADR 의 결정: gateway core 는 sampling 책임 없음.
 - [ ] `Attempts` 슬라이스 길이 제한 — failover 가 10 vendor 깊이면 메모리 부담. cap 옵션?
 - [x] **(결정됨)** `AsyncWrapper` 의 backpressure default 는 **drop newest** (Synthesis pseudocode 의 `select { ... default: dropCounter++ }`). 운영자가 `DroppedEvents()` 로 drop 발생을 모니터링. 다른 정책 (drop oldest / block / sample) 은 별 wrapper 로 caller 가 자체 구현 또는 v0.2 ADR 후보.
 - [ ] **1k RPS 임계치는 추정치** — Histogram lock 경쟁의 실제 임계치는 벤치마크 미실시 상태. v0.1 release 시 100/1k/10k RPS 측정으로 확정 또는 정정 예정. 측정 전까지는 운영자가 자체 부하 테스트로 검증 권장.
 - [ ] **AsyncWrapper ctx propagation 한계** — channel 에 담긴 ctx 는 consumer 가 꺼낼 때 이미 cancelled 일 수 있음. Prometheus counter / histogram 은 ctx 사용 X 이라 무해, 단 향후 OTel adapter 가 ctx 로 parent span 추출하면 span 유실. recording-only backend 는 context-agnostic 하게 구현 권장. OTel adapter 도입 시 별 ADR 에서 ctx propagation 룰 재검토.
-- [ ] `unknown_model_total` 이 PromRecorder 내부 detail — MultiRecorder(prom, logrecorder) 사용 시 log 측에는 unknown model 이벤트 전달 안 됨. 의도된 silent gap. log 에서도 unknown model 추적 필요한 사용자는 LoggingRecorder 가 자체 known-model set 보유해야 함 (PromRecorder 와 별도).
+- [ ] `unknown_model_total` 이 PromRecorder 내부 detail — MultiRecorder(prom, logrecorder) 사용 시 log 측에는 unknown model 이벤트 전달 안 됨. 의도된 silent gap. log 에서도 unknown model 추적 필요한 사용자는 LogRecorder 가 자체 known-model set 보유해야 함 (PromRecorder 와 별도).
 - [ ] OpenTelemetry 도입 시기 — 본 ADR 의 v0.2 후보를 별 ADR-008 로 분리할지 본 ADR 의 Q6 확장으로 갈지

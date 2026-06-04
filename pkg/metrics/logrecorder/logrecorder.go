@@ -10,12 +10,13 @@ import (
 	"github.com/thedev-junyoung/thedev-junyoung-go-llm-gateway/pkg/types"
 )
 
-// Log message constants. Pinned so downstream log-search queries
-// (Datadog / Loki / ELK) have a stable msg field to filter on — renaming
-// either is a breaking change for every existing alert / saved query.
+// Log message constants. Exported so callers can reference them
+// symbolically in test assertions, log-router rules, and alert queries —
+// renaming either is a breaking change for every existing search /
+// dashboard / saved filter, so pin them as a public contract.
 const (
-	msgAttempt  = "gateway attempt"
-	msgFailover = "gateway failover"
+	MsgAttempt  = "gateway attempt"
+	MsgFailover = "gateway failover"
 )
 
 // LogRecorder implements metrics.MetricRecorder by emitting one slog
@@ -39,9 +40,12 @@ func New(logger *slog.Logger) *LogRecorder {
 	return &LogRecorder{logger: logger}
 }
 
-// NewDefault returns a LogRecorder bound to slog.Default(). Use this when
-// you've configured the global slog handler and want the recorder to ride
-// the same handler / level / attribute chain.
+// NewDefault returns a LogRecorder that captures slog.Default() at
+// construction time — calling slog.SetDefault after construction will
+// NOT redirect this recorder's output. Use this when the global slog
+// handler is already configured and will not be swapped at runtime.
+// For dynamic handler swaps, construct your own *slog.Logger and pass
+// it to New so you control the lifecycle.
 func NewDefault() *LogRecorder {
 	return &LogRecorder{logger: slog.Default()}
 }
@@ -71,7 +75,7 @@ func (r *LogRecorder) OnAttempt(ctx context.Context, info provider.AttemptInfo) 
 	if info.Outcome != types.OutcomeSuccess {
 		level = slog.LevelWarn
 	}
-	r.logger.LogAttrs(ctx, level, msgAttempt, attrs...)
+	r.logger.LogAttrs(ctx, level, MsgAttempt, attrs...)
 }
 
 // OnFailover emits one Info-level record per router handoff. Failover is
@@ -79,7 +83,7 @@ func (r *LogRecorder) OnAttempt(ctx context.Context, info provider.AttemptInfo) 
 // would over-flag it — the underlying attempt's Warn record already
 // carries the failure detail.
 func (r *LogRecorder) OnFailover(ctx context.Context, info provider.FailoverInfo) {
-	r.logger.LogAttrs(ctx, slog.LevelInfo, msgFailover,
+	r.logger.LogAttrs(ctx, slog.LevelInfo, MsgFailover,
 		slog.String("request_id", requestctx.From(ctx)),
 		slog.String("from_vendor", info.FromVendor),
 		slog.String("to_vendor", info.ToVendor),

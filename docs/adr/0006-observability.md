@@ -83,7 +83,10 @@ Gateway 가 multi-vendor failover + per-key rate limit 까지 갖춘 v0.1.0-rc �
   - **A. Response 필드만** — caller 가 직접 처리. 메트릭 집계는 caller 책임. 메트릭 라이브러리 의존성 없음. 단점: 매 caller 마다 metric 코드 중복.
   - **B. Recorder hook 만** — gateway 내부 metric recorder 가 attempt 마다 콜백. caller 는 모름. 단점: caller 가 trace 정보 필요할 때 (response logging, request_id correlation) 별도 channel 필요.
   - **C. 둘 다** ✅ — Response 필드는 caller-facing, Recorder hook 은 metric/log facing. 의도가 명확.
-- **왜 이 결정이 정당한가:** ADR-004 가 미룬 이유 (metric 모듈의 요구 사항이 입력) 가 이제 명확해짐 — recorder 패턴이 metric/log 의 공통 sink, response 필드가 caller 의 debugging 용. 두 path 가 서로 직교.
+- **왜 이 결정이 정당한가:** ADR-004 가 미룬 이유 (metric 모듈의 요구 사항이 입력) 가 이제 명확해짐 — recorder 패턴이 metric/log 의 공통 sink, response 필드가 caller 의 debugging 용. 두 path 가 서로 직교 (사용 케이스 다름):
+  - **Concrete operator story for "Response 필드"**: HTTP handler 가 caller (예: chat API) 의 response body 에 `attempts: [...]` 를 그대로 노출 — 사용자 UI 가 "이 응답이 어느 vendor 에서, 몇 번 시도 후 왔는지" 를 즉시 표시. Log pipeline 의 ingestion lag (보통 수 초~분) 없이 same-request scope 의 정보 노출. Recorder hook 만 있으면 이 use case 가 log → polling 으로 우회되어야 함.
+  - **Concrete operator story for "Recorder hook"**: 운영자가 Grafana 에서 vendor 별 실패율 alert 보고 디버깅 — request_id 별 individual response 가 아니라 집계된 metric 이 1차 sink. Response 필드만 있으면 매 caller 가 metric 집계 코드 작성 (DRY 위반).
+  - 두 use case 의 audience 가 다르므로 (사용자 UI vs 운영자 dashboard) "직교" — diverge 위험은 caller mutation 의 trade-off 로 인정 (sub-decision 참고).
 - **Sub-decision (타입 위치, 분할):** trace primitive 들을 SRP 기준으로 **두 패키지에 분할**:
 
   | 타입 | 위치 | 근거 |
@@ -131,6 +134,11 @@ Gateway 가 multi-vendor failover + per-key rate limit 까지 갖춘 v0.1.0-rc �
   - 사용자가 OTel 안 쓰면 dead weight
   - 본 Recorder 인터페이스가 OnAttempt 콜백을 제공하므로, OTel adapter 가 별 모듈 (`pkg/metrics/otel`) 로 적층 가능 — 라이브러리 코어에 강제 의존성 X.
 - **왜 이 결정이 정당한가:** YAGNI. OTel 수요가 실제 발생할 때 별 ADR 로 도입 (v0.2 후보). 본 ADR 은 Recorder 추상화로 future-proof.
+- **Sub-decision (AsyncWrapper ↔ OTel ctx staleness):** AsyncWrapper 를 통한 ctx 는 consumer 가 꺼낼 때 cancelled 가능 — OTel 의 `trace.SpanFromContext(ctx)` 가 parent span 없는 상태. 두 가지 해결책 중 하나를 본 ADR 에서 land 해야 future OTel adapter 의 인터페이스 변경 회피:
+  - **A. `AttemptInfo` 에 trace snapshot 필드** (`TraceID`, `SpanID` string) 추가 — gateway 가 `OnAttempt` 호출 직전 ctx 에서 span ID 를 스냅샷해 info 에 채움. consumer 는 ctx 없이도 trace correlation 가능. 비용: AttemptInfo 가 OTel 의 trace 개념을 의미적으로 안다 (가벼운 leak).
+  - **B. AsyncWrapper + OTel 조합 사용 금지** — godoc 에 명시. OTel adapter 사용자는 sync 호출 또는 자체 wrapper 작성.
+  - **선택: A.** TraceID / SpanID 는 generic string 필드라 OTel 외 다른 trace 시스템 (Datadog APM, Jaeger 직접 등) 에서도 활용 가능. interface 안정성 확보. gateway 가 ctx 에 span 이 없으면 빈 문자열 — OTel 안 쓰는 사용자에게는 cost 0.
+  - 결과로 `AttemptInfo` 에 `TraceID string` + `SpanID string` 추가 (Synthesis 의 provider 패키지 참고).
 - **Maintainer note:** <!-- TODO: 본인 한 줄 voice 로 -->
 
 ### Q7. Cardinality 폭발 방지
@@ -144,6 +152,7 @@ Gateway 가 multi-vendor failover + per-key rate limit 까지 갖춘 v0.1.0-rc �
       - 반-동적 — 어댑터 옵션 (`WithModels([]string)`) 으로 caller 가 등록. date-versioned ID (`gpt-4o-2024-11-20`) 는 caller 가 명시 등록 → redeploy 없이 추가 가능
     - **운영 가시성 보완**: `llm_gateway_unknown_model_total{vendor}` counter 로 unknown bucket 증가 추적. 비정상 증가 시 alert → 어댑터 옵션 추가하거나 어댑터 패치. ADR-001 의 "production-grade" 정체성과 충돌 방지.
     - **발화 책임 (구현 위치):** `PromRecorder` (또는 일반 metric backend) 가 자체 known-model set 을 보유 — caller 가 `prom.New(prom.WithKnownModels([]string{"gpt-4o", "claude-opus-4-7", ...}))` 로 등록. `PromRecorder.OnAttempt` 안에서 `info.Model` 이 known set 에 있으면 그대로 label, 없으면 `model="unknown"` 으로 normalize + `unknown_model_total{vendor=info.Vendor}++`. 책임이 backend recorder 안에 모이고 gateway 는 raw model id 만 전달 — `AttemptInfo` 스키마 변경 없음, `MetricRecorder` 인터페이스 변경 없음.
+    - **Default whitelist:** `PromRecorder` 의 기본값은 **빈 set** — caller 가 `WithKnownModels` 옵션 없이 생성하면 모든 호출이 `model="unknown"` 으로 매핑됨 (의도된 default — caller 가 명시 등록할 때까지 cardinality 보호). 이는 "production 시작 시 alert 가 즉시 뜨는" 의도된 trade-off — 운영자가 model list 등록을 잊지 않게 함. 어댑터에 미리 알려진 model 을 hardcoded fallback 으로 두는 옵션도 가능 (`WithDefaultKnownModelsFromAdapters`) — v0.2 후보.
     - **date-versioned model 의 운영 비용**: OpenAI 가 매월 새 model snapshot 출시 → 안 등록하면 silent unknown. 권장 운영 패턴: alert threshold = unknown_total 이 5분간 ≥ 100 → on-call 이 어댑터 옵션 추가하거나 model alias 확인.
   - `outcome` label — `success` 1개 + ErrorType 9개의 `error_<type>` (아래 enumeration) — 카디널리티 ≤ 10
     | outcome value | trigger |
@@ -233,6 +242,13 @@ type AttemptInfo struct {
 	Duration time.Duration
 	Usage    Usage          // 성공 시
 	Error    *ProviderError // 실패 시
+
+	// Trace snapshot — Q6 의 AsyncWrapper ↔ OTel ctx staleness 해결책 A.
+	// gateway 가 OnAttempt 호출 직전 ctx 에서 span ID 스냅샷. AsyncWrapper 가
+	// consumer 에 보낼 때 ctx 는 cancelled 가능하지만 ID 는 unmodified.
+	// OTel 미사용 시 빈 문자열 — cost 0.
+	TraceID string
+	SpanID  string
 }
 
 type FailoverInfo struct {
@@ -241,51 +257,30 @@ type FailoverInfo struct {
 	Reason     ErrorType
 }
 
-type Outcome string
-
-const (
-	OutcomeSuccess           Outcome = "success"
-	OutcomeErrorRateLimit    Outcome = "error_rate_limit"
-	OutcomeErrorAuth         Outcome = "error_auth"
-	OutcomeErrorOverloaded   Outcome = "error_overloaded"
-	OutcomeErrorServer       Outcome = "error_server"
-	OutcomeErrorTimeout      Outcome = "error_timeout"
-	OutcomeErrorInvalidInput Outcome = "error_invalid_input"
-	OutcomeErrorNotFound     Outcome = "error_not_found"
-	OutcomeErrorPermission   Outcome = "error_permission"
-	OutcomeErrorUnknown      Outcome = "error_unknown"
-)
-
-// OutcomeFromErr 는 *ProviderError 의 Type 을 Outcome 으로 매핑. errors.As 로
-// *ProviderError 추출 후 pe.Type 으로 switch. 매칭 안 되면 OutcomeErrorUnknown.
-func OutcomeFromErr(err error) Outcome {
+// OutcomeFromErr 는 *ProviderError 의 Type 을 types.Outcome 으로 매핑. provider
+// 가 errors.As 로 *ProviderError 추출 후 pe.Type 으로 switch — 매칭 안 되면
+// types.OutcomeErrorUnknown. Outcome / Origin 자체는 pkg/types 에 정의 (위 sub-
+// decision 참고), 이 헬퍼는 mapping 만 담당.
+func OutcomeFromErr(err error) types.Outcome {
 	if err == nil {
-		return OutcomeSuccess
+		return types.OutcomeSuccess
 	}
 	var pe *ProviderError
 	if !errors.As(err, &pe) {
-		return OutcomeErrorUnknown
+		return types.OutcomeErrorUnknown
 	}
 	switch pe.Type {
 	case ErrorTypeRateLimit:
-		return OutcomeErrorRateLimit
+		return types.OutcomeErrorRateLimit
 	case ErrorTypeAuth:
-		return OutcomeErrorAuth
+		return types.OutcomeErrorAuth
 	case ErrorTypeOverloaded:
-		return OutcomeErrorOverloaded
+		return types.OutcomeErrorOverloaded
 	// ... (9개 ErrorType 매핑)
 	default:
-		return OutcomeErrorUnknown
+		return types.OutcomeErrorUnknown
 	}
 }
-
-type Origin string
-
-const (
-	OriginVendor         Origin = "vendor"          // provider 가 응답 (성공 / vendor-side 에러)
-	OriginGatewayPreempt Origin = "gateway-preempt" // rate limit pre-check 차단
-	OriginGatewayRouter  Origin = "gateway-router"  // router 라우팅 실패
-)
 
 // --- pkg/metrics ---
 
@@ -293,8 +288,12 @@ package metrics
 
 import (
 	"context"
+	"log/slog"
+	"sync"
+	"sync/atomic"
 
 	"github.com/thedev-junyoung/thedev-junyoung-go-llm-gateway/pkg/provider"
+	"github.com/thedev-junyoung/thedev-junyoung-go-llm-gateway/pkg/types"
 )
 
 // MetricRecorder 는 gateway 가 매 attempt / failover 마다 호출하는 콜백.
@@ -363,11 +362,15 @@ func (m MultiRecorder) OnFailover(ctx context.Context, info provider.FailoverInf
 // Default backpressure: drop newest (gateway latency 보호 우선). buffer 가 가득 차면
 // 새 event 를 drop 하고 dropCounter 를 증가 — 운영자가 dropCounter 로 backpressure
 // 발생 모니터링.
+//
+// 아래는 완전한 struct 정의 (필드는 Close 메서드 / sync.Once 포함):
 type AsyncWrapper struct {
 	inner       MetricRecorder
 	attemptCh   chan asyncAttempt
 	failoverCh  chan asyncFailover
 	dropCounter atomic.Uint64
+	done        chan struct{}
+	closeOnce   sync.Once
 }
 
 type asyncAttempt struct {
@@ -449,18 +452,6 @@ func (w *AsyncWrapper) consume() {
 func (w *AsyncWrapper) DroppedEvents() uint64 { return w.dropCounter.Load() }
 ```
 
-AsyncWrapper struct 필드 (위에서 생략):
-
-```go
-type AsyncWrapper struct {
-	inner       MetricRecorder
-	attemptCh   chan asyncAttempt
-	failoverCh  chan asyncFailover
-	dropCounter atomic.Uint64
-	done        chan struct{}
-	closeOnce   sync.Once
-}
-```
 
 **gateway 패키지 (Config / New / ChatResponse 확장):**
 
@@ -670,7 +661,7 @@ func (g *Gateway) Chat(ctx context.Context, req provider.ChatRequest) (provider.
 ### Negative
 
 - `gateway.Config.Metrics` 추가 필드 → caller 가 nil 또는 NoOp recorder 명시 결정 부담
-- `ChatResponse.Attempts` 가 매 호출 시 allocation — 빈 호출이라도 1+ entry 슬라이스. p99 latency 에 미미한 영향
+- `ChatResponse.Attempts` 가 매 호출 시 allocation — 빈 호출이라도 1+ entry 슬라이스. 일반 트래픽에서는 p99 latency 영향 미미 (사전 할당 `cap=len(candidates)` + entry 자체가 ~200 bytes). **단 고트래픽 + 깊은 failover (예: 1k+ RPS × 5+ fallback) 환경에서는 GC pressure 가능** — 그 시점에 `AttemptInfo` pool 재사용 또는 "Attempts 비활성화 옵션" (Config.DisableAttempts) 도입 검토 필요. v0.1 release 시 벤치마크 결과 첨부 예정.
 - Recorder hook 콜백이 caller goroutine 에서 실행 — recorder 가 느리면 gateway latency 에 직접 더해진다. 빠른 구현 권장:
   - Prometheus `Counter`: atomic (사실상 lock-free) — OK
   - Prometheus `Histogram.Observe()`: **내부 `sync.Mutex` 사용** — 고트래픽 시 lock 경쟁 발생 가능. 단일 어댑터에서 attemptDuration histogram 호출이 매 attempt 마다 → p99 latency 에 영향. **권장 임계치: ≥ 1k RPS / per Gateway 인스턴스** 이상이면 AsyncWrapper 권장. 이하 트래픽에서는 sync 호출 OK (lock 경쟁 무시 가능). v0.1 release 시 100/1k/10k RPS 벤치마크 결과를 README 에 첨부 예정.

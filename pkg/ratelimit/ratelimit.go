@@ -27,10 +27,12 @@ type RateLimiter interface {
 	Allow(ctx context.Context, providerName, apiKeyHash string, req provider.ChatRequest) (Decision, error)
 
 	// Record reconciles the reservation with actual Usage from the vendor.
-	// Called after a successful Chat. v0.1 in-memory backends MAY no-op here
-	// (the conservative reservation stays in the window until expiry);
-	// production Redis backends refund the (reservation − actual) difference
-	// atomically.
+	// Called after a successful Chat. v0.1 backends MAY no-op — the
+	// conservative reservation ages out of the window naturally. Both
+	// in-tree backends (memory, redis) currently no-op; refund-on-Record
+	// is a follow-up ADR once Usage telemetry shows the over-conservatism
+	// is material in practice. Implementations that DO refund must do so
+	// atomically against the same window Allow wrote to.
 	Record(ctx context.Context, providerName, apiKeyHash string, usage provider.Usage) error
 }
 

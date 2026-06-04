@@ -188,9 +188,12 @@ local cutoff = now - tonumber(ARGV[5])
 local tokens = tonumber(ARGV[4])
 local nonce  = ARGV[6]
 
--- Prune entries older than the window.
-redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, cutoff)
-redis.call('ZREMRANGEBYSCORE', KEYS[2], 0, cutoff)
+-- Prune entries older than the window. Exclusive upper bound ('(' prefix)
+-- matches MemoryBackend's at.Before(cutoff) semantic — an entry whose
+-- score equals cutoff is kept, so the two backends agree on the 60-second
+-- boundary.
+redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, '(' .. cutoff)
+redis.call('ZREMRANGEBYSCORE', KEYS[2], 0, '(' .. cutoff)
 
 -- RPM: one member per request, score=timestamp. ZCARD = requests in window.
 local rpm_used = redis.call('ZCARD', KEYS[1])

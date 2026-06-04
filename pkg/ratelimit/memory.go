@@ -14,13 +14,12 @@ import (
 //
 //   - Multi-instance deployments need the Redis backend instead — two
 //     MemoryBackend instances on different processes don't share state.
-//   - Record is a no-op here: the conservative reservation stays in the
-//     window until it expires. Redis backend refunds the (reservation −
-//     actual) difference inside a Lua script; reproducing that atomicity
-//     across goroutines without overcomplicating the in-memory code isn't
-//     worth it for v0.1 (over-conservative single-instance behavior is
-//     safe — it errs toward under-utilization of the vendor quota, which
-//     is the safe direction).
+//   - Record is a no-op here: the conservative reservation ages out of
+//     the window naturally. Both in-tree backends no-op on Record in
+//     v0.1 — over-conservative behavior errs toward under-utilization
+//     of the vendor quota, which is the safe direction. Refund-on-
+//     Record is a follow-up ADR once Usage telemetry shows the over-
+//     conservatism is material.
 //
 // MemoryBackend is safe for concurrent use.
 type MemoryBackend struct {

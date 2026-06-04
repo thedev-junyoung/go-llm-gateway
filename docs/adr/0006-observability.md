@@ -52,7 +52,7 @@ Gateway 가 multi-vendor failover + per-key rate limit 까지 갖춘 v0.1.0-rc �
 - **Agent reasoning:** 운영 dashboard 의 정형화된 4가지 질문에 답:
   - "현재 어느 vendor 가 실패하나?" → `requests_total{outcome="error"}` by vendor
   - "failover 가 얼마나 발동하나?" → `failovers_total`
-  - "사전 차단이 vendor 429 보다 얼마나 자주 발생하나?" → `requests_total{origin="gateway-preempt"}` vs `origin="vendor-429"`
+  - "사전 차단이 vendor 429 보다 얼마나 자주 발생하나?" → `requests_total{origin="gateway-preempt"}` vs `requests_total{origin="vendor", outcome="error_rate_limit"}`
   - "어느 vendor 가 느린가?" → `attempt_duration_seconds` p99 비교
   - Histogram 만 1개로 줄임 — token usage histogram 은 비용 분석에 유용하지만 본 ADR 에서는 핵심 운영 metric 만 우선 (Q4 의 비용 attribution 은 별도 ADR 후속).
 - **왜 이 결정이 정당한가:** metric 수가 많으면 cardinality 폭발 (Q7) + 운영 부담. 정형화된 4가지 질문에 답하는 최소 셋이 production gateway 의 베이스라인.
@@ -69,6 +69,7 @@ Gateway 가 multi-vendor failover + per-key rate limit 까지 갖춘 v0.1.0-rc �
   - vendor 429 가 많아지면 → rate limit 이 underestimating (예: char/4 휴리스틱이 실제 토큰보다 작음, ADR-005 Q3) → tokenizer 교체 우선순위 상승
   - 두 케이스가 metric 에서 안 분리되면 운영자가 디버깅 시 가설 좁힐 수단 없음.
 - **왜 이 결정이 정당한가:** ADR-005 의 sentinel 통합이 call site 단순화에 옳지만, 그 정보 손실을 metric label 로 보완. 세 origin 의 비율이 운영 가설의 직접 입력.
+- **Sub-decision (ADR-005 fail-open path):** rate limit backend 가 에러 → FailOpen default → vendor 호출 진행. 이 경로의 origin 은 `vendor` (vendor 가 응답하므로). backend 에러 자체는 별 metric (예: `llm_gateway_ratelimit_errors_total`) 으로 분리하거나 slog.Warn 으로만 surface — origin label 의 4번째 state 도입은 사용자 mental model 만 복잡하게 함.
 - **Maintainer note:** <!-- TODO: 본인 한 줄 voice 로 -->
 
 ### Q4. Attempt trace 노출 방식 (ADR-004 Q5 의 미룬 결정)
@@ -120,41 +121,34 @@ Gateway 가 multi-vendor failover + per-key rate limit 까지 갖춘 v0.1.0-rc �
 ### Synthesis — Go pseudocode
 
 ```go
-package metrics
+// 의존성 방향 (순환 방지):
+//   - AttemptInfo / FailoverInfo / Outcome / Origin 은 pkg/provider 에 정의.
+//     ChatResponse.Attempts 가 이 타입을 참조해도 provider → metrics 의존성 X.
+//   - pkg/metrics 는 provider 를 import 해서 위 타입을 사용. provider 는 metrics 를
+//     import 하지 않음. 일방향.
 
-import (
-	"context"
-	"time"
+// --- pkg/provider ---
 
-	"github.com/thedev-junyoung/thedev-junyoung-go-llm-gateway/pkg/provider"
-)
+package provider
 
-// MetricRecorder 는 gateway 가 매 attempt 마다 호출하는 콜백 인터페이스. caller 는
-// 자체 backend (Prometheus / OTel / Datadog / no-op) 의 어댑터를 구현해 주입한다.
-type MetricRecorder interface {
-	// OnAttempt 는 한 attempt 가 완료될 때마다 호출. info 가 trace 의 한 줄.
-	OnAttempt(ctx context.Context, info AttemptInfo)
+import "time"
 
-	// OnFailover 는 한 attempt 의 retriable 실패 후 다음 candidate 로 우회할 때 호출.
-	OnFailover(ctx context.Context, info FailoverInfo)
-}
-
-// AttemptInfo 는 한 vendor 시도의 결과를 표현한다.
+// AttemptInfo 는 한 vendor 시도의 결과. ChatResponse.Attempts 에 들어가는 entry.
 type AttemptInfo struct {
-	Vendor    string                  // provider.Name()
-	Model     string                  // req.Model
-	AttemptN  int                     // 0=primary, 1+=fallback
-	Outcome   Outcome                 // success / error_<type>
-	Origin    Origin                  // vendor / gateway-preempt / gateway-router
-	Duration  time.Duration
-	Usage     provider.Usage          // 성공 시
-	Error     *provider.ProviderError // 실패 시
+	Vendor   string         // Provider.Name()
+	Model    string         // ChatRequest.Model
+	AttemptN int            // 0=primary, 1+=fallback
+	Outcome  Outcome        // success / error_<type>
+	Origin   Origin         // vendor / gateway-preempt / gateway-router
+	Duration time.Duration
+	Usage    Usage          // 성공 시
+	Error    *ProviderError // 실패 시
 }
 
 type FailoverInfo struct {
 	FromVendor string
 	ToVendor   string
-	Reason     provider.ErrorType
+	Reason     ErrorType
 }
 
 type Outcome string
@@ -167,25 +161,57 @@ const (
 type Origin string
 
 const (
-	OriginVendor         Origin = "vendor"          // provider 가 응답
+	OriginVendor         Origin = "vendor"          // provider 가 응답 (성공 / vendor-side 에러)
 	OriginGatewayPreempt Origin = "gateway-preempt" // rate limit pre-check 차단
-	OriginGatewayRouter  Origin = "gateway-router"  // router 가 라우팅 실패
+	OriginGatewayRouter  Origin = "gateway-router"  // router 라우팅 실패
 )
+
+// --- pkg/metrics ---
+
+package metrics
+
+import (
+	"context"
+
+	"github.com/thedev-junyoung/thedev-junyoung-go-llm-gateway/pkg/provider"
+)
+
+// MetricRecorder 는 gateway 가 매 attempt 마다 호출하는 콜백 인터페이스. caller 는
+// 자체 backend (Prometheus / OTel / Datadog / no-op) 의 어댑터를 구현해 주입.
+type MetricRecorder interface {
+	OnAttempt(ctx context.Context, info provider.AttemptInfo)
+	OnFailover(ctx context.Context, info provider.FailoverInfo)
+}
+
+// NoOpRecorder 는 default — Gateway 가 Config.Metrics 가 nil 일 때 사용.
+type NoOpRecorder struct{}
+
+func (NoOpRecorder) OnAttempt(context.Context, provider.AttemptInfo)   {}
+func (NoOpRecorder) OnFailover(context.Context, provider.FailoverInfo) {}
 
 // gateway.Config 확장 — non-breaking.
 type Config struct {
 	Providers []provider.Provider
 	RateLimit ratelimit.RateLimiter
-	Metrics   metrics.MetricRecorder // 새로 추가, nil 이면 no-op
+	Metrics   metrics.MetricRecorder // 새로 추가, nil 이면 New 가 NoOpRecorder{} 로 대체
 }
 
-// ChatResponse 확장 — non-breaking 필드 추가.
+// gateway.New 의 nil → NoOp 대체 (Chat pseudocode 의 nil-check 부담 제거).
+func New(cfg Config) (*Gateway, error) {
+	// ... 기존 validation ...
+	if cfg.Metrics == nil {
+		cfg.Metrics = metrics.NoOpRecorder{}
+	}
+	return &Gateway{providers: cfg.Providers, rateLimit: cfg.RateLimit, metrics: cfg.Metrics}, nil
+}
+
+// provider.ChatResponse 확장 — non-breaking 필드 추가.
 type ChatResponse struct {
 	Content      string
 	FinishReason FinishReason
 	Usage        Usage
 	Raw          []byte
-	Attempts     []AttemptInfo // 새로 추가, 호출자의 debugging 용
+	Attempts     []provider.AttemptInfo // 새로 추가, 호출자의 debugging 용
 }
 ```
 
@@ -198,12 +224,12 @@ import "github.com/prometheus/client_golang/prometheus"
 
 func New() *PromRecorder { /* counter / histogram 등록 */ }
 
-func (r *PromRecorder) OnAttempt(ctx context.Context, info metrics.AttemptInfo) {
+func (r *PromRecorder) OnAttempt(ctx context.Context, info provider.AttemptInfo) {
 	r.requestsTotal.WithLabelValues(info.Vendor, info.Model, string(info.Outcome), string(info.Origin)).Inc()
 	r.attemptDuration.WithLabelValues(info.Vendor, info.Model, string(info.Outcome)).Observe(info.Duration.Seconds())
 }
 
-func (r *PromRecorder) OnFailover(ctx context.Context, info metrics.FailoverInfo) {
+func (r *PromRecorder) OnFailover(ctx context.Context, info provider.FailoverInfo) {
 	r.failoversTotal.WithLabelValues(info.FromVendor, info.ToVendor, string(info.Reason)).Inc()
 }
 ```
@@ -211,55 +237,70 @@ func (r *PromRecorder) OnFailover(ctx context.Context, info metrics.FailoverInfo
 **gateway.Chat 통합:**
 
 ```go
+// recordAttempt 는 OnAttempt 콜백을 호출하면서 recorder 의 panic 을 격리 (Risks 표).
+func (g *Gateway) recordAttempt(ctx context.Context, info provider.AttemptInfo) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.ErrorContext(ctx, "metrics.OnAttempt panicked", "panic", r, "vendor", info.Vendor)
+		}
+	}()
+	g.metrics.OnAttempt(ctx, info)
+}
+
 func (g *Gateway) Chat(ctx context.Context, req provider.ChatRequest) (provider.ChatResponse, error) {
 	primary, fallbacks, err := router.PickWithFallbacks(g.providers, req.Model)
 	if err != nil {
-		g.recordRouterFail(ctx, req, err) // origin=gateway-router
+		// origin=gateway-router. Vendor 가 없으므로 빈 문자열, AttemptN=0.
+		g.recordAttempt(ctx, provider.AttemptInfo{
+			Model: req.Model, Outcome: outcomeFromErr(err),
+			Origin: provider.OriginGatewayRouter, Error: asProviderError(err),
+		})
 		return provider.ChatResponse{}, err
 	}
 
 	candidates := append([]provider.Provider{primary}, fallbacks...)
-	var attempts []metrics.AttemptInfo
+	attempts := make([]provider.AttemptInfo, 0, len(candidates)) // 사전 할당
 	var lastErr error
 
 	for n, p := range candidates {
 		if ctxErr := ctx.Err(); ctxErr != nil { /* dual-wrap ADR-004 */ }
 
-		// rate-limit pre-check (ADR-005)
+		// rate-limit pre-check (ADR-005). FailOpen 시 backend 에러는 origin=vendor
+		// 로 진행 (Q3 의 Open Question 정리 — fail-open 은 vendor 호출로 이어지므로).
 		if g.rateLimit != nil {
 			if d, _ := g.rateLimit.Allow(ctx, p.Name(), p.KeyHash(), req); !d.Allow {
-				info := metrics.AttemptInfo{
+				info := provider.AttemptInfo{
 					Vendor: p.Name(), Model: req.Model, AttemptN: n,
-					Outcome: "error_rate_limit", Origin: metrics.OriginGatewayPreempt,
+					Outcome: "error_rate_limit", Origin: provider.OriginGatewayPreempt,
 				}
 				attempts = append(attempts, info)
-				g.metrics.OnAttempt(ctx, info)
+				g.recordAttempt(ctx, info)
 				// ... failover continue
 			}
 		}
 
 		start := time.Now()
 		resp, cerr := p.Chat(ctx, req)
-		info := metrics.AttemptInfo{
+		info := provider.AttemptInfo{
 			Vendor: p.Name(), Model: req.Model, AttemptN: n,
-			Duration: time.Since(start), Origin: metrics.OriginVendor,
+			Duration: time.Since(start), Origin: provider.OriginVendor,
 		}
 		if cerr == nil {
-			info.Outcome = metrics.OutcomeSuccess
+			info.Outcome = provider.OutcomeSuccess
 			info.Usage = resp.Usage
 			attempts = append(attempts, info)
-			g.metrics.OnAttempt(ctx, info)
+			g.recordAttempt(ctx, info)
 			resp.Attempts = attempts
 			return resp, nil
 		}
 		info.Outcome = outcomeFromErr(cerr)
 		info.Error = asProviderError(cerr)
 		attempts = append(attempts, info)
-		g.metrics.OnAttempt(ctx, info)
+		g.recordAttempt(ctx, info)
 
 		if !shouldFailover(cerr) { /* abort */ }
 		if n+1 < len(candidates) {
-			g.metrics.OnFailover(ctx, metrics.FailoverInfo{
+			g.metrics.OnFailover(ctx, provider.FailoverInfo{
 				FromVendor: p.Name(), ToVendor: candidates[n+1].Name(), Reason: info.Error.Type,
 			})
 		}
@@ -336,6 +377,7 @@ func (g *Gateway) Chat(ctx context.Context, req provider.ChatRequest) (provider.
 
 ## Open Questions
 
+- [x] **(해결됨)** rate limit backend 에러 시 origin — Q3 Sub-decision 에서 `vendor` 로 결정 (FailOpen path 가 vendor 호출로 이어지므로).
 - [ ] Recorder 의 ctx propagation 룰 — OTel adapter 가 등장하면 본 ADR 의 ctx 시그니처가 충분한지 재검토
 - [ ] Metric naming convention — Prometheus 의 `_total` / `_seconds` suffix 외에 다른 명명 규칙 (예: `_count`) 필요한지
 - [ ] Log sampling — 트래픽 폭증 시 OnAttempt 의 매 호출 slog.Info 가 부담. sampling 옵션을 본 ADR 에서 land 할지 별 ADR 로 미룰지

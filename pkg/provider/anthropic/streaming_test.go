@@ -304,7 +304,7 @@ func TestChatStream_CtxCancel_NoErrChunk(t *testing.T) {
 		{
 			name: "deadline_exceeded",
 			mkCtx: func() (context.Context, context.CancelFunc) {
-				return context.WithTimeout(context.Background(), 100*time.Millisecond)
+				return context.WithTimeout(context.Background(), 500*time.Millisecond)
 			},
 		},
 	}

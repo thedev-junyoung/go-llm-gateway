@@ -255,11 +255,12 @@ func (c *Client) dispatchEvent(ev streamEvent, usage *provider.Usage, stopReason
 		if msg == "" {
 			msg = "anthropic stream error"
 		}
-		typ := provider.ErrorTypeServer
-		retriable := true
-		if p.Error.Type == "overloaded_error" {
-			typ = provider.ErrorTypeOverloaded
-		}
+		// Match the sync path's mapHTTPError classification so caller's
+		// retry logic on (sync) and (stream) errors stays consistent.
+		// A mid-stream authentication_error MUST NOT be retriable —
+		// otherwise the caller's "retry if Retriable()" loop would
+		// retry-storm the same dead key.
+		typ, retriable := mapStreamErrorType(p.Error.Type)
 		out <- provider.StreamChunk{
 			FinishReason: provider.FinishUnknown,
 			Err:          provider.NewProviderError(vendorName, typ, 0, retriable, msg, nil),
@@ -269,6 +270,36 @@ func (c *Client) dispatchEvent(ev streamEvent, usage *provider.Usage, stopReason
 	// content_block_start / content_block_stop / ping → no state change,
 	// no chunk emission. Continue.
 	return false
+}
+
+// mapStreamErrorType classifies one of Anthropic's `event: error`
+// payload types into the gateway-neutral (ErrorType, Retriable) pair.
+// Mirrors the sync path's mapHTTPError so retry semantics on the two
+// paths stay consistent — an authentication_error mid-stream is
+// non-retriable the same as a 401 on Chat would be.
+func mapStreamErrorType(t string) (provider.ErrorType, bool) {
+	switch t {
+	case "authentication_error":
+		return provider.ErrorTypeAuth, false
+	case "permission_error":
+		return provider.ErrorTypePermission, false
+	case "invalid_request_error":
+		return provider.ErrorTypeInvalidInput, false
+	case "not_found_error":
+		return provider.ErrorTypeNotFound, false
+	case "rate_limit_error":
+		return provider.ErrorTypeRateLimit, true
+	case "overloaded_error":
+		return provider.ErrorTypeOverloaded, true
+	case "api_error":
+		return provider.ErrorTypeServer, true
+	default:
+		// Conservative default for unknown vendor error types — assume
+		// retriable so a transient unknown failure isn't surfaced as
+		// terminal. Operator dashboards still distinguish via vendor
+		// label + raw message logging.
+		return provider.ErrorTypeServer, true
+	}
 }
 
 // Compile-time assertion that *Client satisfies StreamingProvider.

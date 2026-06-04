@@ -61,8 +61,7 @@ func BenchmarkChat_SingleProvider(b *testing.B) {
 	}
 	ctx := context.Background()
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, err := gw.Chat(ctx, req)
 		if err != nil {
 			b.Fatalf("Chat err = %v", err)
@@ -90,8 +89,7 @@ func BenchmarkChat_FailoverOverhead(b *testing.B) {
 	}
 	ctx := context.Background()
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, err := gw.Chat(ctx, req)
 		if err != nil {
 			b.Fatalf("Chat err = %v", err)

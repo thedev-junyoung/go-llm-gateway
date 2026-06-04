@@ -55,11 +55,26 @@ func run() int {
 
 	// Expose the metrics scrape endpoint on a separate listener — keep it
 	// off the application's main HTTP surface so scrape traffic and tenant
-	// traffic don't share a goroutine pool.
+	// traffic don't share a goroutine pool. Use http.Server so the demo
+	// can shut down cleanly at the end rather than relying on os.Exit to
+	// kill an orphaned goroutine.
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+	metricsSrv := &http.Server{
+		Addr:              "localhost:2112",
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
 	go func() {
-		http.Handle("/metrics", promhttp.Handler())
-		slog.Info("metrics endpoint listening", "addr", "localhost:2112")
-		_ = http.ListenAndServe("localhost:2112", nil) //nolint:gosec // demo only
+		slog.Info("metrics endpoint listening", "addr", metricsSrv.Addr)
+		if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("metrics server stopped unexpectedly", "err", err)
+		}
+	}()
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = metricsSrv.Shutdown(shutdownCtx)
 	}()
 
 	// Wait a beat so the listener is up before the first scrape opportunity.

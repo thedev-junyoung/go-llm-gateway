@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -267,6 +268,8 @@ func TestChat_UnsupportedModel(t *testing.T) {
 func TestChat_ErrorMapping(t *testing.T) {
 	t.Parallel()
 
+	// Subtest name uses status code (not Type) because two cases share the
+	// same Type — 500/503 both map to ErrorTypeServer.
 	cases := []struct {
 		status    int
 		body      string
@@ -286,7 +289,7 @@ func TestChat_ErrorMapping(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		t.Run(string(tc.wantType), func(t *testing.T) {
+		t.Run(fmt.Sprintf("status_%d", tc.status), func(t *testing.T) {
 			t.Parallel()
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				w.WriteHeader(tc.status)
@@ -319,14 +322,106 @@ func TestChat_ErrorMapping(t *testing.T) {
 	}
 }
 
-func TestChat_ContextCanceled(t *testing.T) {
+// TestChat_RetryAfterHeader_DeltaSeconds pins the same Retry-After contract
+// the openai and anthropic adapters already provide — a 429 with a vendor
+// backoff hint MUST surface on *ProviderError.RetryAfter so the router can
+// honor it instead of dog-piling the vendor.
+func TestChat_RetryAfterHeader_DeltaSeconds(t *testing.T) {
 	t.Parallel()
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		time.Sleep(500 * time.Millisecond)
-		w.WriteHeader(http.StatusOK)
+		w.Header().Set("Retry-After", "42")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"code":429,"message":"slow"}}`))
 	}))
 	defer srv.Close()
+
+	c := gemini.New("AIza-test", gemini.WithBaseURL(srv.URL))
+	_, err := c.Chat(context.Background(), provider.ChatRequest{
+		Model:    "gemini-1.5-flash",
+		Messages: []provider.Message{{Role: provider.RoleUser, Content: "hi"}},
+	})
+	var pe *provider.ProviderError
+	if !errors.As(err, &pe) {
+		t.Fatalf("err is not *ProviderError: %v", err)
+	}
+	if pe.RetryAfter == nil {
+		t.Fatal("RetryAfter nil — 429 + Retry-After header should attach the hint")
+	}
+	if *pe.RetryAfter != 42*time.Second {
+		t.Errorf("RetryAfter = %v, want 42s", *pe.RetryAfter)
+	}
+}
+
+func TestChat_RetryAfterHeader_HTTPDate(t *testing.T) {
+	t.Parallel()
+
+	future := time.Now().Add(30 * time.Second).UTC().Format(http.TimeFormat)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", future)
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"code":429,"message":"slow"}}`))
+	}))
+	defer srv.Close()
+
+	c := gemini.New("AIza-test", gemini.WithBaseURL(srv.URL))
+	_, err := c.Chat(context.Background(), provider.ChatRequest{
+		Model:    "gemini-1.5-flash",
+		Messages: []provider.Message{{Role: provider.RoleUser, Content: "hi"}},
+	})
+	var pe *provider.ProviderError
+	if !errors.As(err, &pe) {
+		t.Fatalf("err is not *ProviderError: %v", err)
+	}
+	if pe.RetryAfter == nil {
+		t.Fatal("RetryAfter nil — HTTP-date Retry-After should parse")
+	}
+	if *pe.RetryAfter <= 0 || *pe.RetryAfter > 60*time.Second {
+		t.Errorf("RetryAfter = %v, want in (0, 60s] from 30-second-future HTTP-date", *pe.RetryAfter)
+	}
+}
+
+func TestChat_RetryAfterHeader_Invalid_NoField(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "definitely-not-a-duration")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"code":429,"message":"slow"}}`))
+	}))
+	defer srv.Close()
+
+	c := gemini.New("AIza-test", gemini.WithBaseURL(srv.URL))
+	_, err := c.Chat(context.Background(), provider.ChatRequest{
+		Model:    "gemini-1.5-flash",
+		Messages: []provider.Message{{Role: provider.RoleUser, Content: "hi"}},
+	})
+	var pe *provider.ProviderError
+	if !errors.As(err, &pe) {
+		t.Fatalf("err is not *ProviderError: %v", err)
+	}
+	if pe.RetryAfter != nil {
+		t.Errorf("RetryAfter = %v, want nil for unparseable header", pe.RetryAfter)
+	}
+}
+
+func TestChat_ContextCanceled(t *testing.T) {
+	t.Parallel()
+
+	// unblock is the handler's "the caller cancelled, stop pretending to
+	// be slow" signal — the previous sleep-based implementation made every
+	// run of this test take 500ms regardless of how fast the client
+	// aborted. With this channel the test finishes the moment the client
+	// times out and we just unblock the handler to let srv.Close return.
+	unblock := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		<-unblock
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer func() {
+		close(unblock)
+		srv.Close()
+	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()

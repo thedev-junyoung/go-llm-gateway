@@ -27,6 +27,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -342,7 +343,30 @@ func mapHTTPError(resp *http.Response, body []byte) *provider.ProviderError {
 		typ, retriable = provider.ErrorTypeUnknown, false
 	}
 
-	return provider.NewProviderError(vendorName, typ, resp.StatusCode, retriable, msg, nil)
+	pe := provider.NewProviderError(vendorName, typ, resp.StatusCode, retriable, msg, nil)
+	if ra := resp.Header.Get("Retry-After"); ra != "" {
+		if d, ok := parseRetryAfter(ra); ok {
+			pe = pe.WithRetryAfter(d)
+		}
+	}
+	return pe
+}
+
+// parseRetryAfter handles both delta-seconds and HTTP-date per RFC 7231.
+// Same shape as the openai/anthropic adapters so callers can rely on a
+// consistent RetryAfter hint regardless of which vendor returned the 429.
+func parseRetryAfter(s string) (time.Duration, bool) {
+	if secs, err := strconv.Atoi(s); err == nil && secs >= 0 {
+		return time.Duration(secs) * time.Second, true
+	}
+	if t, err := http.ParseTime(s); err == nil {
+		d := time.Until(t)
+		if d < 0 {
+			d = 0
+		}
+		return d, true
+	}
+	return 0, false
 }
 
 // Compile-time interface satisfaction.

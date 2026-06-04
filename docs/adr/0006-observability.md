@@ -13,10 +13,10 @@ Gateway 가 multi-vendor failover + per-key rate limit 까지 갖춘 v0.1.0-rc �
 
 영향 모듈:
 
-- `pkg/metrics` (신규) — metric recorder 인터페이스 + Prometheus 기본 구현
-- `pkg/logging` (신규 또는 doc 만) — structured log 필드 표준
+- `pkg/metrics` (신규) — metric recorder 인터페이스 + Prometheus 기본 구현 + `AsyncWrapper` (느린 backend 격리)
+- `pkg/provider` — `AttemptInfo` / `FailoverInfo` / `Outcome` / `Origin` 타입 추가 + `ChatResponse.Attempts` 필드 (의존성 일방향)
 - `gateway.Chat` — attempt 단위 측정 hook 추가 (rate limit / vendor 응답 / failover)
-- `provider.Provider` — 추가 변경 없음 (기존 Name() / Vendor() 로 label 채움)
+- structured log 필드 표준 — **신규 패키지 없음**, Q5 에서 slog 필드 명세만 land (logging 패키지 신설은 over-engineering, slog 가 stdlib)
 
 추가 제약:
 
@@ -34,19 +34,20 @@ Gateway 가 multi-vendor failover + per-key rate limit 까지 갖춘 v0.1.0-rc �
 - **Decision:** B — **표준 interface 정의 + Prometheus client_go 기본 구현 동시 제공**.
 - **Agent reasoning:** 세 가지 후보 비교:
   - **Prometheus client_go only** — Go 진영에서 사실상 표준. 단 호출자가 OpenTelemetry / Datadog SDK 를 쓰면 어댑터 작성 부담.
-  - **OpenTelemetry only** — vendor-neutral, future-proof. 그러나 metric API 가 아직 일부 stable (Go SDK 가 spec 보다 늦음), 외부 의존성이 무거움 (~10MB add).
+  - **OpenTelemetry only** — vendor-neutral, future-proof. 그러나 metric API 가 아직 일부 stable (Go SDK 가 spec 보다 늦음), 외부 의존성이 무거움 (otel-go SDK + propagators ≈ 5MB 추가 — Q6 와 일치).
   - **인터페이스 + Prometheus 기본** ✅ — `MetricRecorder` 인터페이스가 base. 호출자는 직접 구현하거나 (예: OTel adapter) 라이브러리가 제공하는 Prometheus 구현 사용. Rate Limit 의 backend pluggable 패턴 (ADR-005 Q1) 과 일관.
 - **왜 이 결정이 정당한가:** Prometheus 가 default 인 게 진입성 측면에서 압도적이지만, 한 vendor 에 hard-bind 되면 OpenTelemetry / Datadog 사용자의 진입 장벽. 인터페이스 base + 기본 구현 동시 제공이 ADR-005 의 패턴과 일관.
 - **Maintainer note:** <!-- TODO: 본인 한 줄 voice 로 -->
 
 ### Q2. Metric 셋 (어떤 metric 을 노출하나)
 
-- **Decision:** **Counter 2 + Histogram 1** — 최소 셋:
+- **Decision:** **Counter 3 + Histogram 1** — 최소 셋:
 
   | metric | type | labels | 의미 |
   |---|---|---|---|
   | `llm_gateway_requests_total` | counter | `vendor`, `model`, `outcome`, `origin` | 모든 attempt 의 결과 (vendor 별 분해) |
   | `llm_gateway_failovers_total` | counter | `from_vendor`, `to_vendor`, `reason` | failover trigger 발생 횟수 (cascading 분석) |
+  | `llm_gateway_unknown_model_total` | counter | `vendor` | 어댑터가 모르는 model id 호출 횟수 (Q7 의 whitelist silencing 보완 — unknown bucket 비정상 증가 alert) |
   | `llm_gateway_attempt_duration_seconds` | histogram | `vendor`, `model`, `outcome` | per-attempt 응답시간 (p50/p95/p99) |
 
 - **Agent reasoning:** 운영 dashboard 의 정형화된 4가지 질문에 답:
@@ -69,7 +70,7 @@ Gateway 가 multi-vendor failover + per-key rate limit 까지 갖춘 v0.1.0-rc �
   - vendor 429 가 많아지면 → rate limit 이 underestimating (예: char/4 휴리스틱이 실제 토큰보다 작음, ADR-005 Q3) → tokenizer 교체 우선순위 상승
   - 두 케이스가 metric 에서 안 분리되면 운영자가 디버깅 시 가설 좁힐 수단 없음.
 - **왜 이 결정이 정당한가:** ADR-005 의 sentinel 통합이 call site 단순화에 옳지만, 그 정보 손실을 metric label 로 보완. 세 origin 의 비율이 운영 가설의 직접 입력.
-- **Sub-decision (ADR-005 fail-open path):** rate limit backend 가 에러 → FailOpen default → vendor 호출 진행. 이 경로의 origin 은 `vendor` (vendor 가 응답하므로). backend 에러 자체는 별 metric (예: `llm_gateway_ratelimit_errors_total`) 으로 분리하거나 slog.Warn 으로만 surface — origin label 의 4번째 state 도입은 사용자 mental model 만 복잡하게 함.
+- **Sub-decision (ADR-005 fail-open path):** rate limit backend 가 에러 → FailOpen default → vendor 호출 진행. 이 경로의 origin 은 `vendor` (vendor 가 응답하므로). backend 에러 자체는 **`slog.Warn` 으로 surface (metric 신설 X)** — backend 에러는 운영자 alert 의 1차 채널이 log (Loki / Grafana log panel) 이고, metric 신설은 cardinality 추가 + dashboard 복잡도만 늘림. 4번째 origin state 도입은 사용자 mental model 만 복잡하게 함.
 - **Maintainer note:** <!-- TODO: 본인 한 줄 voice 로 -->
 
 ### Q4. Attempt trace 노출 방식 (ADR-004 Q5 의 미룬 결정)
@@ -82,19 +83,34 @@ Gateway 가 multi-vendor failover + per-key rate limit 까지 갖춘 v0.1.0-rc �
   - **B. Recorder hook 만** — gateway 내부 metric recorder 가 attempt 마다 콜백. caller 는 모름. 단점: caller 가 trace 정보 필요할 때 (response logging, request_id correlation) 별도 channel 필요.
   - **C. 둘 다** ✅ — Response 필드는 caller-facing, Recorder hook 은 metric/log facing. 의도가 명확.
 - **왜 이 결정이 정당한가:** ADR-004 가 미룬 이유 (metric 모듈의 요구 사항이 입력) 가 이제 명확해짐 — recorder 패턴이 metric/log 의 공통 sink, response 필드가 caller 의 debugging 용. 두 path 가 서로 직교.
-- **Sub-decision (타입 위치):** `AttemptInfo` / `FailoverInfo` / `Outcome` / `Origin` 은 `pkg/provider` 에 둔다. 대안은 `pkg/core` 같은 별 공유 타입 패키지를 만드는 것 — 검토했지만 reject:
-  - `Outcome` / `Origin` 은 observability 개념이긴 하나, **gateway 의 모든 attempt 가 type 으로 표현하는 동일 trace primitive** 이므로 provider 패키지가 자기 `Usage` / `ProviderError` 와 같이 두는 게 자연스럽다 (Usage / FinishReason 도 이미 provider 에 있음 — 둘 다 "응답 분류" 의미)
-  - `pkg/core` 신설은 provider 와 1:1 동일 의존 그래프를 갖는 빈 패키지 추가 — 책임 분리 효과 없이 import 한 줄만 늘림 (Go 패키지 비용 = vendoring + IDE indexing)
-  - 패키지 책임은 "vendor wire contract" + "그 attempt 의 trace primitive" 까지로 확장 — provider 책임 범위 확장은 의도된 선택, silent 가 아님 (본 sub-decision 으로 명시).
+- **Sub-decision (타입 위치):** `AttemptInfo` / `FailoverInfo` / `Outcome` / `Origin` 은 `pkg/provider` 에 둔다. 세 옵션 모두 검토:
+
+  | 옵션 | 의존성 그래프 | reject 사유 |
+  |---|---|---|
+  | `pkg/metrics` 안에 정의 (역방향) | provider 가 metrics 를 import 안 함, metrics 가 자체 정의 | `ChatResponse.Attempts []AttemptInfo` 가 provider → metrics 의존성 발생 → 순환. provider 가 metrics 의 일부 타입을 import 하면 archi 룰 (provider 가 base layer) 위반 |
+  | `pkg/gateway` 안에 정의 | gateway 가 attempt 집계 주체이므로 자연 | ChatResponse 가 provider 패키지인데 Attempts 필드만 gateway 패키지의 타입 → 응답 구조가 두 패키지에 split, caller 의 import 부담 증가 |
+  | **`pkg/provider` 안에 정의** ✅ | provider 가 base, metrics 가 provider 를 import (일방향) | 선택 |
+
+  - `Outcome` / `Origin` 은 observability 의미이지만, **gateway 의 모든 attempt 가 type 으로 표현하는 동일 trace primitive** 라 응답 contract 의 일부로 봐도 무방
+  - `Usage` / `FinishReason` 도 provider 에 있고 둘 다 "응답 + 분류" 의미 — Outcome 이 그 의미 카테고리 안에 들어감
+  - 패키지 책임은 "vendor wire contract + 그 attempt 의 trace primitive" 까지 확장 — provider 책임 범위 확장은 의도된 선택 (본 sub-decision 으로 명시, silent 가 아님)
+  - 추가 비용: 향후 OTel adapter / 새 observability 모듈도 `pkg/provider` 를 import — 이건 일방향이라 OK (base 가 어차피 어디서나 import 됨)
+
+- **Sub-decision (Attempts 슬라이스 mutation):** `ChatResponse.Attempts` 는 caller-owned 슬라이스. caller 가 응답 받은 후 element 를 mutate 해도 라이브러리는 영향 없음 (다음 호출에 재사용 안 함). 단 **recorder 가 이미 emit 한 metric 과 응답 필드가 diverge** 할 수 있음 — 이건 Q4 의 trade-off 로 인정. caller 가 응답을 다른 곳에 forward 할 때 mutation 안 하는 게 정상 사용. mutation 검출 / freeze 는 over-engineering (Go 에 immutable slice 표준 없음).
 - **Maintainer note:** <!-- TODO: 본인 한 줄 voice 로 -->
 
 ### Q5. Structured logging 표준
 
-- **Decision:** **`log/slog` 표준 필드 명시 + recorder hook 에서 자동 emit**.
+- **Decision:** **`log/slog` 표준 필드 명세 + 분리된 `LoggingRecorder` 모듈**.
   - 표준 필드: `request_id`, `vendor`, `model`, `attempt`, `outcome`, `duration_ms`, `origin`
-  - `MetricRecorder.OnAttempt` 가 위 필드로 slog.Info / Warn 호출 (recorder 구현이 책임)
-- **Agent reasoning:** Go 1.21+ 의 `log/slog` 가 사실상 표준이 됐고, gateway 내부에서 이미 ADR-005 fail-open 시 `slog.WarnContext` 사용. caller 가 자체 logger 를 쓰면 `slog.Default()` 를 자기 logger 로 바꾸면 됨 (호출 측 책임). 라이브러리는 *어떤 필드를* emit 할지만 정함.
-- **왜 이 결정이 정당한가:** slog 가 stdlib 으로 들어와서 호환성 부담 0. 필드 표준화가 grep/Loki query 의 일관성을 보장. logger 인스턴스 자체는 caller 가 control.
+  - `LoggingRecorder` (별 모듈, `pkg/metrics/logrecorder`) 는 `MetricRecorder` 인터페이스 구현체로, OnAttempt 마다 위 필드로 `slog.Info` / `slog.Warn` emit
+  - **MetricRecorder 자체는 slog 책임 없음** — 사용자가 metric 만 / log 만 / 둘 다 자유롭게 조합. MultiRecorder 로 합성 가능 (`metrics.Multi(promRecorder, logrecorder.New())`)
+- **Agent reasoning:** 초기 draft 는 OnAttempt 가 slog 도 emit 하는 책임 결합. 그러면 `Config.Metrics = nil` (NoOpRecorder) 사용자는 metric 도 log 도 둘 다 잃음 — log-only 사용 케이스 불가. 책임 분리 후:
+  - Metric 만: `prom.New()`
+  - Log 만: `logrecorder.New()`
+  - 둘 다: `metrics.Multi(prom.New(), logrecorder.New())`
+  - 둘 다 없음: nil → NoOp
+- **왜 이 결정이 정당한가:** SRP (single responsibility) — recorder 가 metric backend 추상화이고, log emission 은 별 책임. 분리하면 caller 의 조합 자유 + nil recorder 가 명시적 의미 (둘 다 비활성) 유지.
 - **Maintainer note:** <!-- TODO: 본인 한 줄 voice 로 -->
 
 ### Q6. Distributed tracing (OpenTelemetry spans)
@@ -113,8 +129,11 @@ Gateway 가 multi-vendor failover + per-key rate limit 까지 갖춘 v0.1.0-rc �
 - **Decision:** **`key_hash` 는 metric label 에서 제외, `model` 은 표준 모델명만 허용**.
   - `vendor` label — provider.Name() (예: "openai", "anthropic") — 카디널리티 ≤ 10
   - `model` label — vendor 의 표준 model id ("gpt-4o", "claude-opus-4-7" 등) — 카디널리티 ≤ 50
-    - **whitelist 유래**: `Provider.SupportsModel(model)` 가 true 인 model id 만 그대로, 나머지는 `unknown` 으로 fallback. whitelist 는 vendor adapter 가 build time 에 결정 (정적). 신규 model 추가는 어댑터 patch + redeploy.
-    - **운영 가시성 보완**: `llm_gateway_unknown_model_total{vendor}` 별 counter 를 추가로 노출. unknown bucket 이 비정상으로 커지면 alert 발생 → silent silencing 회피. ADR-001 의 "production-grade" 정체성과 충돌 방지.
+    - **whitelist 유래**: `Provider.SupportsModel(model)` 이 true 인 model id 만 그대로 통과, 나머지는 `unknown` 으로 fallback. SupportsModel 의 실제 데이터 소스는 어댑터 구현에 따라 다름:
+      - 정적 (build-time) — `gpt-4o`, `gpt-4o-mini` 같은 안정 family 는 어댑터에 하드코딩
+      - 반-동적 — 어댑터 옵션 (`WithModels([]string)`) 으로 caller 가 등록. date-versioned ID (`gpt-4o-2024-11-20`) 는 caller 가 명시 등록 → redeploy 없이 추가 가능
+    - **운영 가시성 보완**: `llm_gateway_unknown_model_total{vendor}` counter 로 unknown bucket 증가 추적. 비정상 증가 시 alert → 어댑터 옵션 추가하거나 어댑터 패치. ADR-001 의 "production-grade" 정체성과 충돌 방지.
+    - **date-versioned model 의 운영 비용**: OpenAI 가 매월 새 model snapshot 출시 → 안 등록하면 silent unknown. 권장 운영 패턴: alert threshold = unknown_total 이 5분간 ≥ 100 → on-call 이 어댑터 옵션 추가하거나 model alias 확인.
   - `outcome` label — `success` 1개 + ErrorType 9개의 `error_<type>` (아래 enumeration) — 카디널리티 ≤ 10
     | outcome value | trigger |
     |---|---|
@@ -184,8 +203,28 @@ const (
 	OutcomeErrorUnknown      Outcome = "error_unknown"
 )
 
-// OutcomeFromErr 는 ErrorType → Outcome 매핑. 비-*ProviderError 는 ErrorUnknown.
-func OutcomeFromErr(err error) Outcome { /* switch on ErrorType */ }
+// OutcomeFromErr 는 *ProviderError 의 Type 을 Outcome 으로 매핑. errors.As 로
+// *ProviderError 추출 후 pe.Type 으로 switch. 매칭 안 되면 OutcomeErrorUnknown.
+func OutcomeFromErr(err error) Outcome {
+	if err == nil {
+		return OutcomeSuccess
+	}
+	var pe *ProviderError
+	if !errors.As(err, &pe) {
+		return OutcomeErrorUnknown
+	}
+	switch pe.Type {
+	case ErrorTypeRateLimit:
+		return OutcomeErrorRateLimit
+	case ErrorTypeAuth:
+		return OutcomeErrorAuth
+	case ErrorTypeOverloaded:
+		return OutcomeErrorOverloaded
+	// ... (9개 ErrorType 매핑)
+	default:
+		return OutcomeErrorUnknown
+	}
+}
 
 type Origin string
 
@@ -228,6 +267,82 @@ func (NoOpRecorder) OnFailover(context.Context, provider.FailoverInfo) {}
 
 // 컴파일 타임 contract assertion.
 var _ MetricRecorder = NoOpRecorder{}
+
+// MultiRecorder 는 여러 recorder 를 합성 — caller 가 Prometheus + LoggingRecorder
+// 등 둘 다 받을 때 사용.
+type MultiRecorder []MetricRecorder
+
+func Multi(recorders ...MetricRecorder) MultiRecorder { return MultiRecorder(recorders) }
+
+func (m MultiRecorder) OnAttempt(ctx context.Context, info provider.AttemptInfo) {
+	for _, r := range m {
+		r.OnAttempt(ctx, info)
+	}
+}
+func (m MultiRecorder) OnFailover(ctx context.Context, info provider.FailoverInfo) {
+	for _, r := range m {
+		r.OnFailover(ctx, info)
+	}
+}
+
+// AsyncWrapper 는 slow recorder (OTel exporter, Datadog flush 등) 를 caller goroutine
+// 밖으로 격리. buffered channel + background consumer goroutine. 본 ADR 의 결정으로
+// pkg/metrics 안에 land (Open Question 의 backpressure 정책만 향후 별 ADR 후보).
+//
+// Default backpressure: drop newest (gateway latency 보호 우선). buffer 가 가득 차면
+// 새 event 를 drop 하고 dropCounter 를 증가 — 운영자가 dropCounter 로 backpressure
+// 발생 모니터링.
+type AsyncWrapper struct {
+	inner       MetricRecorder
+	attemptCh   chan asyncAttempt
+	failoverCh  chan asyncFailover
+	dropCounter atomic.Uint64
+}
+
+type asyncAttempt struct {
+	ctx  context.Context
+	info provider.AttemptInfo
+}
+type asyncFailover struct {
+	ctx  context.Context
+	info provider.FailoverInfo
+}
+
+func NewAsyncWrapper(inner MetricRecorder, bufSize int) *AsyncWrapper {
+	w := &AsyncWrapper{
+		inner:      inner,
+		attemptCh:  make(chan asyncAttempt, bufSize),
+		failoverCh: make(chan asyncFailover, bufSize),
+	}
+	go w.consume()
+	return w
+}
+
+func (w *AsyncWrapper) OnAttempt(ctx context.Context, info provider.AttemptInfo) {
+	select {
+	case w.attemptCh <- asyncAttempt{ctx, info}:
+	default:
+		w.dropCounter.Add(1)
+	}
+}
+func (w *AsyncWrapper) OnFailover(ctx context.Context, info provider.FailoverInfo) {
+	select {
+	case w.failoverCh <- asyncFailover{ctx, info}:
+	default:
+		w.dropCounter.Add(1)
+	}
+}
+func (w *AsyncWrapper) consume() {
+	for {
+		select {
+		case ev := <-w.attemptCh:
+			w.inner.OnAttempt(ev.ctx, ev.info)
+		case ev := <-w.failoverCh:
+			w.inner.OnFailover(ev.ctx, ev.info)
+		}
+	}
+}
+func (w *AsyncWrapper) DroppedEvents() uint64 { return w.dropCounter.Load() }
 ```
 
 **gateway 패키지 (Config / New / ChatResponse 확장):**
@@ -441,7 +556,7 @@ func (g *Gateway) Chat(ctx context.Context, req provider.ChatRequest) (provider.
 - `ChatResponse.Attempts` 가 매 호출 시 allocation — 빈 호출이라도 1+ entry 슬라이스. p99 latency 에 미미한 영향
 - Recorder hook 콜백이 caller goroutine 에서 실행 — recorder 가 느리면 gateway latency 에 직접 더해진다. 빠른 구현 권장:
   - Prometheus `Counter`: atomic (사실상 lock-free) — OK
-  - Prometheus `Histogram.Observe()`: **내부 `sync.Mutex` 사용** — 고트래픽 시 lock 경쟁 발생 가능. 단일 어댑터에서 attemptDuration histogram 호출이 매 attempt 마다 → p99 latency 에 영향 측정 필요.
+  - Prometheus `Histogram.Observe()`: **내부 `sync.Mutex` 사용** — 고트래픽 시 lock 경쟁 발생 가능. 단일 어댑터에서 attemptDuration histogram 호출이 매 attempt 마다 → p99 latency 에 영향. **권장 임계치: ≥ 1k RPS / per Gateway 인스턴스** 이상이면 AsyncWrapper 권장. 이하 트래픽에서는 sync 호출 OK (lock 경쟁 무시 가능). v0.1 release 시 100/1k/10k RPS 벤치마크 결과를 README 에 첨부 예정.
   - OTel remote exporter / Datadog flush 등 IO blocking 구현: 반드시 AsyncWrapper 로 격리 (recorder.go 의 godoc CONTRACT 참고).
   - Recorder 가 내부 goroutine 을 spawn 하면 gateway 의 `recover()` 가 panic 못 잡음 — 그런 recorder 는 자체 recover 필수.
 
@@ -470,7 +585,7 @@ func (g *Gateway) Chat(ctx context.Context, req provider.ChatRequest) (provider.
 - [x] **(해결됨)** rate limit backend 에러 시 origin — Q3 Sub-decision 에서 `vendor` 로 결정 (FailOpen path 가 vendor 호출로 이어지므로).
 - [ ] Recorder 의 ctx propagation 룰 — OTel adapter 가 등장하면 본 ADR 의 ctx 시그니처가 충분한지 재검토
 - [ ] Metric naming convention — Prometheus 의 `_total` / `_seconds` suffix 외에 다른 명명 규칙 (예: `_count`) 필요한지
-- [ ] Log sampling — 트래픽 폭증 시 OnAttempt 의 매 호출 slog.Info 가 부담. sampling 옵션을 본 ADR 에서 land 할지 별 ADR 로 미룰지. `SampledRecorder` wrapper (예: 1/N 또는 reservoir 샘플링) 가 AsyncWrapper 와 같은 모듈에 적층 가능.
+- [x] **(결정됨)** Log sampling 은 본 ADR 에서 미룸 — `LoggingRecorder` 가 별 모듈이므로 caller 가 자체 sampling 로직을 wrapping 가능 (예: `SampledRecorder` 를 직접 구현하거나 slog handler 의 sampling 사용). v0.2 에서 `SampledRecorder` 표준 wrapper 도입 여부는 별 ADR. 본 ADR 의 결정: gateway core 는 sampling 책임 없음.
 - [ ] `Attempts` 슬라이스 길이 제한 — failover 가 10 vendor 깊이면 메모리 부담. cap 옵션?
 - [ ] `AsyncWrapper` 의 backpressure 정책 (drop oldest / drop newest / block / sample) — 어느 게 default 인가? 별 작은 ADR 후보.
 - [ ] OpenTelemetry 도입 시기 — 본 ADR 의 v0.2 후보를 별 ADR-008 로 분리할지 본 ADR 의 Q6 확장으로 갈지

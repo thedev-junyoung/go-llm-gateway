@@ -114,6 +114,7 @@ Gateway 가 multi-vendor failover + per-key rate limit 까지 갖춘 v0.1.0-rc �
 ### Q5. Structured logging 표준
 
 - **Decision:** **`log/slog` 표준 필드 명세 + 분리된 `LogRecorder` 모듈**.
+  - **타입명 (구현 결정):** `LogRecorder` — 초기 draft 의 `LoggingRecorder` 는 동명사 접두(`Logging`)가 동작/주체 둘 다로 해석 가능해 모호. PromRecorder 와 cadence 맞춘 명사형이 역할 (record-keeper) 을 더 직접적으로 표현. ADR 본문은 구현 landing 시점에 일괄 rename — 추후 grep / search 의 zero-result 방지.
   - 표준 필드: `request_id`, `vendor`, `model`, `attempt`, `outcome`, `duration_ms`, `origin`
   - `LogRecorder` (별 모듈, `pkg/metrics/logrecorder`) 는 `MetricRecorder` 인터페이스 구현체로, OnAttempt 마다 위 필드로 `slog.Info` / `slog.Warn` emit
   - **MetricRecorder 자체는 slog 책임 없음** — 사용자가 metric 만 / log 만 / 둘 다 자유롭게 조합. MultiRecorder 로 합성 가능 (`metrics.Multi(promRecorder, logrecorder.New())`)
@@ -123,6 +124,11 @@ Gateway 가 multi-vendor failover + per-key rate limit 까지 갖춘 v0.1.0-rc �
   - 둘 다: `metrics.Multi(prom.New(), logrecorder.New())`
   - 둘 다 없음: nil → NoOp
 - **왜 이 결정이 정당한가:** SRP (single responsibility) — recorder 가 metric backend 추상화이고, log emission 은 별 책임. 분리하면 caller 의 조합 자유 + nil recorder 가 명시적 의미 (둘 다 비활성) 유지.
+- **Sub-decision (인터페이스 conflation 의 인정된 trade-off):** semantic 으론 metric (집계 숫자) ≠ log (개별 이벤트) — 관찰 주기 / 보존 정책 / drop 허용도 다름. 그럼에도 두 구현체를 동일 `MetricRecorder` 인터페이스로 통합하는 이유:
+  - **조합 패턴 재사용** — `metrics.Multi(prom, log)` 가 fan-out 의 single source of truth. 별 `LogRecorder` 인터페이스 + 별 `LogMultiRecorder` 도입은 같은 패턴 두 번 작성 + caller 가 두 필드 (`Config.Metrics` + `Config.Logger`) 채우는 부담.
+  - **인터페이스 시그니처 동일** — 둘 다 `OnAttempt(ctx, AttemptInfo)` / `OnFailover(ctx, FailoverInfo)` 로 충분. 추상화가 자연.
+  - **인정된 비용** — `Config.Metrics` 에 `LogRecorder` 가 들어가면 독자가 "metric backend" 로 오독 가능. doc + 변수명 (`MetricRecorder` → 향후 `ObservabilityRecorder` rename 후보) 으로 완화. 본 ADR 의 trade-off 인정은 향후 인터페이스 분리 PR 이 별 ADR 없이 시도되지 않도록 trail 보존.
+  - 대안 (별 `LogRecorder` 인터페이스) 은 Alt 7 에서 검토.
 - **Maintainer note:** <!-- TODO: 본인 한 줄 voice 로 -->
 
 ### Q6. Distributed tracing (OpenTelemetry spans)
@@ -153,6 +159,7 @@ Gateway 가 multi-vendor failover + per-key rate limit 까지 갖춘 v0.1.0-rc �
     - **발화 책임 (gateway 레이어):** model normalize 는 **gateway 가 담당** — `Config.KnownModels []string` 옵션 (default empty) 으로 caller 가 화이트리스트 등록. `gateway.Chat` 이 AttemptInfo 를 만들 때 `info.Model` 이 known set 에 없으면 `"unknown"` 으로 normalize 후 recorder hook 호출. 결과: 모든 recorder (PromRecorder / LogRecorder / Multi) 가 **동일한 normalized model** 수신 — Q5 의 metric/log asymmetry 자동 해결.
     - **`unknown_model_total` 발화:** PromRecorder.OnAttempt 에서 `info.Model == "unknown"` 일 때 `unknownModelTotal{vendor}++`. gateway 가 normalize 했으므로 PromRecorder 는 단순 check.
     - **Default whitelist:** `Config.KnownModels` 의 기본값은 **빈 set** — 등록 안 하면 모든 호출이 `"unknown"` 매핑 (cardinality 보호 + 운영자에게 alert 즉시). 어댑터에 hardcoded fallback (`gateway.WithDefaultKnownModelsFromAdapters`) 옵션은 v0.2 후보.
+    - **LogRecorder 의 asymmetric cost:** normalize 가 gateway 레이어이므로 LogRecorder 도 `model="unknown"` 만 받음 — cardinality 가 비용 요인이 아닌 log 측 사용자도 KnownModels 미등록 시 log 의 `model` 필드가 전부 `"unknown"` 으로 찍힘 (Loki / CloudWatch Logs Insights 에서 model 별 필터 / facet 불가). log 포렌식이 필요한 caller 는 KnownModels 등록 필수. 이 asymmetry 가 의도된 비용 — 인터페이스 conflation (Q5 sub-decision) 의 follow-on. 대안: LogRecorder 가 raw model 받는 별 normalize 우회는 "모든 recorder 가 동일 input" 원칙 위반 + 인터페이스 시그니처에 raw/normalized 둘 다 싣는 부담.
     - **이전 round 의 PromRecorder-내 whitelist 결정 reposition:** 초기 draft 는 PromRecorder.WithKnownModels 였음. critic 의 지적 (PromRecorder / LogRecorder asymmetry: log 측은 raw model 받음, metric 측은 normalize) 수용해 책임을 gateway 로 상향. recorder 인터페이스 변경 없음 (input data 만 일관).
     - **date-versioned model 의 운영 비용**: OpenAI 가 매월 새 model snapshot 출시 → 안 등록하면 silent unknown. 권장 운영 패턴: alert threshold = unknown_total 이 5분간 ≥ 100 → on-call 이 어댑터 옵션 추가하거나 model alias 확인.
   - `outcome` label — `success` 1개 + ErrorType 9개의 `error_<type>` (아래 enumeration) — 카디널리티 ≤ 10
@@ -684,6 +691,24 @@ func (g *Gateway) Chat(ctx context.Context, req provider.ChatRequest) (provider.
 - **단점:** Cardinality 폭발 (사용자 수 = unique combinations). Prometheus / Grafana cost 증가.
 - **안 선택한 이유:** 별 metric 으로 분리 (opt-in). Default 셋은 운영 baseline 만.
 
+### Alt 7 — Q5 `slog.Handler` 미들웨어 패턴 (LogRecorder 신설 우회)
+
+대안: `MetricRecorder` 를 구현하는 별 모듈 대신, gateway 가 attempt context (vendor / model / outcome 등) 를 ctx 에 push 하고 caller 가 등록한 custom `slog.Handler` wrapper 가 기존 모든 log record 에 attempt fields 를 자동 inject. Recorder 신설 없이 기존 slog pipeline 에 통합 가능 → "metric 과 log 를 같은 인터페이스에" 끼워맞추는 문제가 사라짐.
+
+**Reject 이유:**
+- gateway 내부가 모든 log call site 에 attempt context 를 주입할 수 없음 — recorder hook 은 attempt 단위 단일 발화 지점을 보장하지만, 미들웨어 패턴은 "어떤 log call 이 어떤 attempt 에 속하는지" 가 ctx span 에 묶임. ctx 가 멀티 goroutine 으로 fan-out 되면 attempt boundary 가 흐려짐.
+- caller 가 "내 기존 slog pipeline 에 gateway attempt 도 끼워 보내고 싶음" 이 아니라 "gateway 의 attempt 가 발생할 때마다 1 record" 가 표준 요구 — 미들웨어 패턴은 record 빈도가 caller 의 다른 log call 빈도에 의존하므로 attempt 단위 보장 불가.
+- 결과: 인터페이스 conflation 의 비용 (Q5 sub-decision) 을 받아들이는 게 attempt 단위 보장 + 패턴 단순성 측면에서 우위.
+
+### Alt 8 — Q6 OpenTelemetry Logs API (v0.2 후보)
+
+OTel trace 를 v0.1 에 미룬 이유 (SDK 무거움) 는 타당하나, **OTel Logs API** 는 metric 과 log 를 자연스럽게 분리하며 본 ADR 의 인터페이스 conflation 문제를 해결한다. caller 가 OTel collector 에 metric + log 둘 다 보내는 통합 운영 환경에서는 자연스러운 선택.
+
+**v0.1 reject 이유:**
+- OTel Logs SDK 도 trace 와 동일한 weight 부담 (별 ADR-008 OTel 시점에 일괄 land).
+- `LogRecorder` 가 별 모듈이므로 OTel Logs adapter 도 같은 `MetricRecorder` 인터페이스 구현으로 future-proof — 본 ADR 의 추상화가 OTel Logs 채택을 막지 않음.
+- **v0.2 후보로 명시:** OTel Logs adapter (`pkg/metrics/otellog`) 추가 시 별 ADR-008 또는 OTel 통합 ADR 에서 결정. 본 ADR 의 인터페이스 분리 결정 (`LogRecorder` 별 모듈) 이 v0.2 OTel Logs 추가 부담을 줄임.
+
 ---
 
 ## Consequences
@@ -716,6 +741,7 @@ func (g *Gateway) Chat(ctx context.Context, req provider.ChatRequest) (provider.
 | OTel adapter 가 나중에 ctx propagation 룰 충돌 | recorder hook 시그니처에 ctx 포함 → adapter 가 자체 span 추출 가능. 단 AsyncWrapper 통과 시 ctx 는 stale 가능 (Open Question 참고) |
 | `outcome` label 의 값 폭발 (vendor 가 새 error code 추가) | ErrorType 9개로 제한, 매핑되지 않으면 "error_unknown" |
 | AsyncWrapper Close() race 로 마지막 N event 손실 | CONTRACT 명시 — caller 의 graceful shutdown sequence 책임 (producer 중지 → in-flight 대기 → Close). 본 wrapper 는 zero-loss 보장 X |
+| **AsyncWrapper + LogRecorder 조합 시 log entry 손실** — metric drop (카운터 손실) 은 통계적으로 tolerable 하지만, log drop 은 post-mortem 의 attempt chain 구멍. 특히 error 경로 `slog.LevelWarn` 레코드 손실 시 사후 분석 불가. | 권장: 에러 포렌식이 critical 한 환경에서는 slow handler 라도 sync 유지 (Histogram 처럼 lock 경쟁만 신경) 또는 `DroppedEvents()` alert 구성 (`> 0` 이면 페이지). LogRecorder 전용 AsyncWrapper variant (drop 대신 blocking-with-timeout) 는 v0.2 후보. |
 | MultiRecorder 의 한 recorder 가 panic 하면 다른 recorder 도 호출 안 됨 | 개별 recover() 로 격리. Synthesis pseudocode 에 명시. 단 recorder 가 자체 goroutine spawn 후 panic 시는 못 잡음 (Risks 의 일반 recover 한계와 동일) |
 
 ---

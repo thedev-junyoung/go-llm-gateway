@@ -127,12 +127,14 @@ Gateway 가 multi-vendor failover + per-key rate limit 까지 갖춘 v0.1.0-rc �
 ### Q7. Cardinality 폭발 방지
 
 - **Decision:** **`key_hash` 는 metric label 에서 제외, `model` 은 표준 모델명만 허용**.
-  - `vendor` label — provider.Name() (예: "openai", "anthropic") — 카디널리티 ≤ 10
+  - `vendor` label (또는 `from_vendor` / `to_vendor` for failovers_total) — provider.Name() (예: "openai", "anthropic") — 카디널리티 ≤ 10
+  - `reason` label (failovers_total) — ErrorType 9개 — 카디널리티 ≤ 10
   - `model` label — vendor 의 표준 model id ("gpt-4o", "claude-opus-4-7" 등) — 카디널리티 ≤ 50
     - **whitelist 유래**: `Provider.SupportsModel(model)` 이 true 인 model id 만 그대로 통과, 나머지는 `unknown` 으로 fallback. SupportsModel 의 실제 데이터 소스는 어댑터 구현에 따라 다름:
       - 정적 (build-time) — `gpt-4o`, `gpt-4o-mini` 같은 안정 family 는 어댑터에 하드코딩
       - 반-동적 — 어댑터 옵션 (`WithModels([]string)`) 으로 caller 가 등록. date-versioned ID (`gpt-4o-2024-11-20`) 는 caller 가 명시 등록 → redeploy 없이 추가 가능
     - **운영 가시성 보완**: `llm_gateway_unknown_model_total{vendor}` counter 로 unknown bucket 증가 추적. 비정상 증가 시 alert → 어댑터 옵션 추가하거나 어댑터 패치. ADR-001 의 "production-grade" 정체성과 충돌 방지.
+    - **발화 책임 (구현 위치):** `PromRecorder` (또는 일반 metric backend) 가 자체 known-model set 을 보유 — caller 가 `prom.New(prom.WithKnownModels([]string{"gpt-4o", "claude-opus-4-7", ...}))` 로 등록. `PromRecorder.OnAttempt` 안에서 `info.Model` 이 known set 에 있으면 그대로 label, 없으면 `model="unknown"` 으로 normalize + `unknown_model_total{vendor=info.Vendor}++`. 책임이 backend recorder 안에 모이고 gateway 는 raw model id 만 전달 — `AttemptInfo` 스키마 변경 없음, `MetricRecorder` 인터페이스 변경 없음.
     - **date-versioned model 의 운영 비용**: OpenAI 가 매월 새 model snapshot 출시 → 안 등록하면 silent unknown. 권장 운영 패턴: alert threshold = unknown_total 이 5분간 ≥ 100 → on-call 이 어댑터 옵션 추가하거나 model alias 확인.
   - `outcome` label — `success` 1개 + ErrorType 9개의 `error_<type>` (아래 enumeration) — 카디널리티 ≤ 10
     | outcome value | trigger |
@@ -313,6 +315,7 @@ func NewAsyncWrapper(inner MetricRecorder, bufSize int) *AsyncWrapper {
 		inner:      inner,
 		attemptCh:  make(chan asyncAttempt, bufSize),
 		failoverCh: make(chan asyncFailover, bufSize),
+		done:       make(chan struct{}),
 	}
 	go w.consume()
 	return w
@@ -332,9 +335,29 @@ func (w *AsyncWrapper) OnFailover(ctx context.Context, info provider.FailoverInf
 		w.dropCounter.Add(1)
 	}
 }
+
+// Close 는 background goroutine 을 종료. caller 의 책임 — Gateway 가 GC 되거나
+// 프로세스 종료 전 명시 호출. 이중 호출 안전 (close 된 channel 재close 는 panic
+// 이므로 done 채널 sentinel 패턴 사용).
+func (w *AsyncWrapper) Close() error {
+	w.closeOnce.Do(func() { close(w.done) })
+	return nil
+}
+
 func (w *AsyncWrapper) consume() {
 	for {
 		select {
+		case <-w.done:
+			// drain 남은 event 후 종료.
+			for len(w.attemptCh) > 0 || len(w.failoverCh) > 0 {
+				select {
+				case ev := <-w.attemptCh:
+					w.inner.OnAttempt(ev.ctx, ev.info)
+				case ev := <-w.failoverCh:
+					w.inner.OnFailover(ev.ctx, ev.info)
+				}
+			}
+			return
 		case ev := <-w.attemptCh:
 			w.inner.OnAttempt(ev.ctx, ev.info)
 		case ev := <-w.failoverCh:
@@ -343,6 +366,19 @@ func (w *AsyncWrapper) consume() {
 	}
 }
 func (w *AsyncWrapper) DroppedEvents() uint64 { return w.dropCounter.Load() }
+```
+
+AsyncWrapper struct 필드 (위에서 생략):
+
+```go
+type AsyncWrapper struct {
+	inner       MetricRecorder
+	attemptCh   chan asyncAttempt
+	failoverCh  chan asyncFailover
+	dropCounter atomic.Uint64
+	done        chan struct{}
+	closeOnce   sync.Once
+}
 ```
 
 **gateway 패키지 (Config / New / ChatResponse 확장):**
@@ -435,7 +471,7 @@ func (g *Gateway) Chat(ctx context.Context, req provider.ChatRequest) (provider.
 	if err != nil {
 		// origin=gateway-router. Vendor 가 없으므로 빈 문자열, AttemptN=0.
 		g.recordAttempt(ctx, provider.AttemptInfo{
-			Model: req.Model, Outcome: outcomeFromErr(err),
+			Model: req.Model, Outcome: provider.OutcomeFromErr(err),
 			Origin: provider.OriginGatewayRouter, Error: asProviderError(err),
 		})
 		return provider.ChatResponse{}, err
@@ -476,8 +512,8 @@ func (g *Gateway) Chat(ctx context.Context, req provider.ChatRequest) (provider.
 			resp.Attempts = attempts
 			return resp, nil
 		}
-		info.Outcome = outcomeFromErr(cerr)
-		info.Error = asProviderError(cerr)
+		info.Outcome = provider.OutcomeFromErr(cerr) // provider 패키지의 exported helper
+		info.Error = asProviderError(cerr)            // errors.As(cerr, &pe) wrapping (nil 반환 가능)
 		attempts = append(attempts, info)
 		g.recordAttempt(ctx, info)
 
@@ -587,5 +623,5 @@ func (g *Gateway) Chat(ctx context.Context, req provider.ChatRequest) (provider.
 - [ ] Metric naming convention — Prometheus 의 `_total` / `_seconds` suffix 외에 다른 명명 규칙 (예: `_count`) 필요한지
 - [x] **(결정됨)** Log sampling 은 본 ADR 에서 미룸 — `LoggingRecorder` 가 별 모듈이므로 caller 가 자체 sampling 로직을 wrapping 가능 (예: `SampledRecorder` 를 직접 구현하거나 slog handler 의 sampling 사용). v0.2 에서 `SampledRecorder` 표준 wrapper 도입 여부는 별 ADR. 본 ADR 의 결정: gateway core 는 sampling 책임 없음.
 - [ ] `Attempts` 슬라이스 길이 제한 — failover 가 10 vendor 깊이면 메모리 부담. cap 옵션?
-- [ ] `AsyncWrapper` 의 backpressure 정책 (drop oldest / drop newest / block / sample) — 어느 게 default 인가? 별 작은 ADR 후보.
+- [x] **(결정됨)** `AsyncWrapper` 의 backpressure default 는 **drop newest** (Synthesis pseudocode 의 `select { ... default: dropCounter++ }`). 운영자가 `DroppedEvents()` 로 drop 발생을 모니터링. 다른 정책 (drop oldest / block / sample) 은 별 wrapper 로 caller 가 자체 구현 또는 v0.2 ADR 후보.
 - [ ] OpenTelemetry 도입 시기 — 본 ADR 의 v0.2 후보를 별 ADR-008 로 분리할지 본 ADR 의 Q6 확장으로 갈지

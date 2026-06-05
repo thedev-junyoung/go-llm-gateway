@@ -211,6 +211,61 @@ func TestChatStream_Metrics_MidStreamError_StreamDurationOutcome(t *testing.T) {
 	}
 }
 
+// TestChatStream_Metrics_ErrChunkBeforeFirstToken_BothOutcomes pins the
+// intended split when the adapter emits an Err chunk WITHOUT ever
+// sending a ContentDelta. The two histograms answer different
+// questions and so they intentionally surface different outcomes from
+// the same event:
+//
+//   - TTFT (user-perceived "did anything start streaming?") =
+//     pre_stream_failure — caller never saw a token, dashboards
+//     should treat this the same as a vendor-level reject.
+//   - stream_duration (lifecycle classification) = mid_stream_error —
+//     the stream channel did open and surface a structured Err,
+//     distinguishing it from "vendor closed silently with no chunks"
+//     (pre_stream_failure on stream_duration too).
+//
+// This guards a future refactor from collapsing the two outcomes —
+// either direction would lose information operators rely on.
+func TestChatStream_Metrics_ErrChunkBeforeFirstToken_BothOutcomes(t *testing.T) {
+	t.Parallel()
+
+	pe := provider.NewProviderError("openai", provider.ErrorTypeServer, 500, true, "vendor stream borked", nil)
+	p := newFakeStreaming("openai", []string{"gpt-4o"},
+		// Single Err chunk, no preceding ContentDelta.
+		[]provider.StreamChunk{
+			{FinishReason: provider.FinishUnknown, Err: pe},
+		}, nil)
+
+	rec := &captureStreamingRecorder{}
+	gw, _ := gateway.New(gateway.Config{
+		Providers:   []provider.Provider{p},
+		Metrics:     rec,
+		KnownModels: []string{"gpt-4o"},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	stream, err := gw.ChatStream(ctx, provider.ChatRequest{
+		Model:    "gpt-4o",
+		Messages: []provider.Message{{Role: provider.RoleUser, Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("ChatStream err = %v", err)
+	}
+	drainStream(stream)
+
+	ttft := rec.snapshotTTFT()
+	if len(ttft) != 1 || ttft[0].outcome != metrics.StreamOutcomePreStreamFailure {
+		t.Errorf("TTFT = %+v, want one pre_stream_failure (no token ever reached caller)", ttft)
+	}
+	dur := rec.snapshotDuration()
+	if len(dur) != 1 || dur[0].outcome != metrics.StreamOutcomeMidStreamError {
+		t.Errorf("stream_duration = %+v, want one mid_stream_error (Err chunk did flow)", dur)
+	}
+}
+
 // TestChatStream_Metrics_NormalizesUnknownModel pins ADR-006 Q7's
 // "unknown" normalization on the streaming path — if the requested
 // model isn't in KnownModels, both histograms see the "unknown"

@@ -41,11 +41,14 @@ import (
 // parked on a send until the underlying HTTP transport eventually
 // returns. See ADR-007 Risks table.
 //
-// TTFT measurement and stream_duration metrics are wired in a follow-
-// up PR (PR-6 in the ADR-007 series). v0.2 callers see the stream
-// directly from the chosen adapter; the metric wrapper goroutine
-// will be slotted between adapter and caller without breaking this
-// signature.
+// TTFT and stream_duration metrics: when Config.Metrics satisfies
+// metrics.StreamingMetricRecorder, the returned channel is wrapped
+// with a relay goroutine that emits one TTFT observation per
+// candidate (success on first ContentDelta, pre_stream_failure on
+// vendor reject, ctx_cancel_before_first_chunk on caller abort) and
+// one stream_duration observation at channel close (success /
+// mid_stream_error / ctx_cancel_before_first_chunk). Recorders that
+// don't satisfy the streaming interface are silently bypassed.
 func (g *Gateway) ChatStream(ctx context.Context, req provider.ChatRequest) (<-chan provider.StreamChunk, error) {
 	model := normalizeModel(req.Model, g.knownModels)
 

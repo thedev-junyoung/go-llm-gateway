@@ -88,7 +88,7 @@ func NewWithRegisterer(reg prometheus.Registerer) *PromRecorder {
 
 		unknownModelTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: metricUnknownModelTotal,
-			Help: "Number of Chat attempts whose Model label collapsed to \"unknown\" because the gateway's Config.KnownModels did not include the requested model id. A spike means a new vendor model leaked through without configuration.",
+			Help: "Number of gateway attempts (Chat or ChatStream) whose Model label collapsed to \"unknown\" because the gateway's Config.KnownModels did not include the requested model id. A spike means a new vendor model leaked through without configuration.",
 		}, []string{"vendor"}),
 
 		attemptDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{

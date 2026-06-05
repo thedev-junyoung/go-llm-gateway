@@ -118,7 +118,7 @@ func TestOnAttempt_UnknownModel_IncrementsUnknownTotal(t *testing.T) {
 	})
 
 	const want = `
-# HELP llm_gateway_unknown_model_total Number of Chat attempts whose Model label collapsed to "unknown" because the gateway's Config.KnownModels did not include the requested model id. A spike means a new vendor model leaked through without configuration.
+# HELP llm_gateway_unknown_model_total Number of gateway attempts (Chat or ChatStream) whose Model label collapsed to "unknown" because the gateway's Config.KnownModels did not include the requested model id. A spike means a new vendor model leaked through without configuration.
 # TYPE llm_gateway_unknown_model_total counter
 llm_gateway_unknown_model_total{vendor="openai"} 1
 `

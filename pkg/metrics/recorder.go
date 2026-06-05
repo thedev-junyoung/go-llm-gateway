@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"context"
+	"time"
 
 	"github.com/thedev-junyoung/thedev-junyoung-go-llm-gateway/pkg/provider"
 )
@@ -25,11 +26,22 @@ func (NoOpRecorder) OnAttempt(context.Context, provider.AttemptInfo) {}
 // OnFailover does nothing.
 func (NoOpRecorder) OnFailover(context.Context, provider.FailoverInfo) {}
 
+// ObserveFirstTokenLatency does nothing. Implemented so NoOpRecorder
+// also satisfies StreamingMetricRecorder — the gateway's
+// wrapWithMetrics path can type-assert without a nil branch.
+func (NoOpRecorder) ObserveFirstTokenLatency(string, string, string, time.Duration) {}
+
+// ObserveStreamDuration does nothing. See ObserveFirstTokenLatency.
+func (NoOpRecorder) ObserveStreamDuration(string, string, string, time.Duration) {}
+
 // Compile-time interface checks. Pinning every public recorder type here
 // surfaces signature drift at build time instead of at the first OnAttempt
 // call from a real caller.
 var (
-	_ MetricRecorder = NoOpRecorder{}
-	_ MetricRecorder = MultiRecorder(nil)
-	_ MetricRecorder = (*AsyncWrapper)(nil)
+	_ MetricRecorder          = NoOpRecorder{}
+	_ MetricRecorder          = MultiRecorder(nil)
+	_ MetricRecorder          = (*AsyncWrapper)(nil)
+	_ StreamingMetricRecorder = NoOpRecorder{}
+	_ StreamingMetricRecorder = MultiRecorder(nil)
+	_ StreamingMetricRecorder = (*AsyncWrapper)(nil)
 )

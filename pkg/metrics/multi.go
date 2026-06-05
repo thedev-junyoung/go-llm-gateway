@@ -3,6 +3,7 @@ package metrics
 import (
 	"context"
 	"log/slog"
+	"time"
 
 	"github.com/thedev-junyoung/thedev-junyoung-go-llm-gateway/pkg/provider"
 )
@@ -65,4 +66,49 @@ func callFailover(ctx context.Context, r MetricRecorder, info provider.FailoverI
 		}
 	}()
 	r.OnFailover(ctx, info)
+}
+
+// ObserveFirstTokenLatency forwards to every recorder that satisfies
+// StreamingMetricRecorder. Sync-only recorders in the slice are
+// silently skipped — same idiom the gateway uses to filter streaming
+// providers. Per-recorder recover() isolates panics.
+func (m MultiRecorder) ObserveFirstTokenLatency(vendor, model, outcome string, d time.Duration) {
+	for _, r := range m {
+		sr, ok := r.(StreamingMetricRecorder)
+		if !ok {
+			continue
+		}
+		callObserveTTFT(sr, vendor, model, outcome, d)
+	}
+}
+
+// ObserveStreamDuration forwards to every streaming-aware recorder.
+func (m MultiRecorder) ObserveStreamDuration(vendor, model, outcome string, d time.Duration) {
+	for _, r := range m {
+		sr, ok := r.(StreamingMetricRecorder)
+		if !ok {
+			continue
+		}
+		callObserveStreamDuration(sr, vendor, model, outcome, d)
+	}
+}
+
+func callObserveTTFT(r StreamingMetricRecorder, vendor, model, outcome string, d time.Duration) {
+	defer func() {
+		if p := recover(); p != nil {
+			slog.Error("metrics.MultiRecorder ObserveFirstTokenLatency panicked",
+				"panic", p, "vendor", vendor, "model", model, "outcome", outcome)
+		}
+	}()
+	r.ObserveFirstTokenLatency(vendor, model, outcome, d)
+}
+
+func callObserveStreamDuration(r StreamingMetricRecorder, vendor, model, outcome string, d time.Duration) {
+	defer func() {
+		if p := recover(); p != nil {
+			slog.Error("metrics.MultiRecorder ObserveStreamDuration panicked",
+				"panic", p, "vendor", vendor, "model", model, "outcome", outcome)
+		}
+	}()
+	r.ObserveStreamDuration(vendor, model, outcome, d)
 }

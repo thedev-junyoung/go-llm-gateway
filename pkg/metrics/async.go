@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/thedev-junyoung/thedev-junyoung-go-llm-gateway/pkg/provider"
 )
@@ -90,6 +91,31 @@ func (w *AsyncWrapper) OnFailover(ctx context.Context, info provider.FailoverInf
 // observability has gaps.
 func (w *AsyncWrapper) DroppedEvents() uint64 {
 	return w.dropCounter.Load()
+}
+
+// ObserveFirstTokenLatency forwards SYNCHRONOUSLY to the inner recorder
+// when it satisfies StreamingMetricRecorder; otherwise no-ops. Unlike
+// OnAttempt/OnFailover which queue with drop-newest, streaming metric
+// Observe is not buffered — histogram .Observe on Prometheus client_go
+// is an atomic-ish O(1) bucket lookup, so the cost of async-ing it
+// exceeds the cost of the sync call.
+//
+// If your inner StreamingMetricRecorder is a slow exporter (OTel
+// remote push, network sink), wrap that recorder independently — not
+// through AsyncWrapper — because the existing buffered design covers
+// OnAttempt/OnFailover only.
+func (w *AsyncWrapper) ObserveFirstTokenLatency(vendor, model, outcome string, d time.Duration) {
+	if sr, ok := w.inner.(StreamingMetricRecorder); ok {
+		sr.ObserveFirstTokenLatency(vendor, model, outcome, d)
+	}
+}
+
+// ObserveStreamDuration forwards SYNCHRONOUSLY. See
+// ObserveFirstTokenLatency for the sync-vs-async rationale.
+func (w *AsyncWrapper) ObserveStreamDuration(vendor, model, outcome string, d time.Duration) {
+	if sr, ok := w.inner.(StreamingMetricRecorder); ok {
+		sr.ObserveStreamDuration(vendor, model, outcome, d)
+	}
 }
 
 // Close stops the consumer goroutine. Best-effort drain of buffered events

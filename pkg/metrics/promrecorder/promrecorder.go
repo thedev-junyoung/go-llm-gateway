@@ -2,6 +2,7 @@ package promrecorder
 
 import (
 	"context"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 
@@ -14,10 +15,12 @@ import (
 // have a single source of truth — renaming a constant is a breaking change
 // for every existing operator setup.
 const (
-	metricRequestsTotal       = "llm_gateway_requests_total"
-	metricFailoversTotal      = "llm_gateway_failovers_total"
-	metricUnknownModelTotal   = "llm_gateway_unknown_model_total"
-	metricAttemptDurationSecs = "llm_gateway_attempt_duration_seconds"
+	metricRequestsTotal        = "llm_gateway_requests_total"
+	metricFailoversTotal       = "llm_gateway_failovers_total"
+	metricUnknownModelTotal    = "llm_gateway_unknown_model_total"
+	metricAttemptDurationSecs  = "llm_gateway_attempt_duration_seconds"
+	metricFirstTokenLatencySec = "llm_gateway_first_token_latency_seconds"
+	metricStreamDurationSecs   = "llm_gateway_stream_duration_seconds"
 )
 
 // defaultDurationBuckets covers the typical LLM completion latency range
@@ -26,6 +29,14 @@ const (
 // real-world distribution for LLM workloads.
 var defaultDurationBuckets = []float64{
 	0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 30, 60,
+}
+
+// firstTokenBuckets is the TTFT (time-to-first-token) distribution.
+// The user-perceived UX bar is sub-500ms; the buckets cluster more
+// finely there than defaultDurationBuckets so dashboards see real
+// movement when TTFT regresses by ±50ms (which IS user-visible).
+var firstTokenBuckets = []float64{
+	0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20,
 }
 
 // PromRecorder is the Prometheus-backed MetricRecorder. Construct with New
@@ -37,10 +48,16 @@ type PromRecorder struct {
 	failoversTotal    *prometheus.CounterVec
 	unknownModelTotal *prometheus.CounterVec
 	attemptDuration   *prometheus.HistogramVec
+	firstTokenLatency *prometheus.HistogramVec
+	streamDuration    *prometheus.HistogramVec
 }
 
-// Compile-time assertion that PromRecorder satisfies MetricRecorder.
-var _ metrics.MetricRecorder = (*PromRecorder)(nil)
+// Compile-time assertions: PromRecorder satisfies both the base and
+// streaming-aware MetricRecorder interfaces. ADR-007 Q5.
+var (
+	_ metrics.MetricRecorder          = (*PromRecorder)(nil)
+	_ metrics.StreamingMetricRecorder = (*PromRecorder)(nil)
+)
 
 // New returns a PromRecorder registered against prometheus.DefaultRegisterer.
 // Panics on duplicate registration — the default Registerer rejects collisions
@@ -71,7 +88,7 @@ func NewWithRegisterer(reg prometheus.Registerer) *PromRecorder {
 
 		unknownModelTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: metricUnknownModelTotal,
-			Help: "Number of Chat attempts whose Model label collapsed to \"unknown\" because the gateway's Config.KnownModels did not include the requested model id. A spike means a new vendor model leaked through without configuration.",
+			Help: "Number of gateway attempts (Chat or ChatStream) whose Model label collapsed to \"unknown\" because the gateway's Config.KnownModels did not include the requested model id. A spike means a new vendor model leaked through without configuration.",
 		}, []string{"vendor"}),
 
 		attemptDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
@@ -79,8 +96,21 @@ func NewWithRegisterer(reg prometheus.Registerer) *PromRecorder {
 			Help:    "Distribution of per-attempt latency in seconds. Observed only when origin == vendor — pre-empt and router-failure attempts have Duration=0 and would corrupt the p50/p95/p99 buckets.",
 			Buckets: defaultDurationBuckets,
 		}, []string{"vendor", "model", "outcome"}),
+
+		firstTokenLatency: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    metricFirstTokenLatencySec,
+			Help:    "Distribution of streaming time-to-first-token (TTFT) in seconds. Observed once per ChatStream call. The outcome label distinguishes the success case (first ContentDelta!=\"\" arrived) from pre-stream failure and ctx-cancel-before-first-chunk paths.",
+			Buckets: firstTokenBuckets,
+		}, []string{"vendor", "model", "outcome"}),
+
+		streamDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    metricStreamDurationSecs,
+			Help:    "Distribution of streaming lifecycle duration in seconds — from ChatStream entry until the producer goroutine closes the channel. Outcome distinguishes normal completion (success) from pre-stream failure, ctx cancel, and mid-stream error.",
+			Buckets: defaultDurationBuckets,
+		}, []string{"vendor", "model", "outcome"}),
 	}
-	reg.MustRegister(r.requestsTotal, r.failoversTotal, r.unknownModelTotal, r.attemptDuration)
+	reg.MustRegister(r.requestsTotal, r.failoversTotal, r.unknownModelTotal,
+		r.attemptDuration, r.firstTokenLatency, r.streamDuration)
 	return r
 }
 
@@ -119,4 +149,29 @@ func (r *PromRecorder) OnFailover(_ context.Context, info provider.FailoverInfo)
 		info.ToVendor,
 		"error_"+string(info.Reason),
 	).Inc()
+}
+
+// ObserveFirstTokenLatency records one TTFT observation. The gateway's
+// wrapWithMetrics emits exactly one of these per ChatStream call. The
+// outcome label is one of metrics.StreamOutcome* constants — using the
+// shared vocabulary keeps PromQL queries portable across recorders.
+func (r *PromRecorder) ObserveFirstTokenLatency(vendor, model, outcome string, d time.Duration) {
+	r.firstTokenLatency.WithLabelValues(vendor, model, outcome).Observe(d.Seconds())
+
+	// Reuse the existing unknown_model alert path so the same operator
+	// query covers sync + streaming. Without this, a Loki-only operator
+	// staring at the streaming surface would miss the unknown-model
+	// drift signal.
+	if model == "unknown" {
+		r.unknownModelTotal.WithLabelValues(vendor).Inc()
+	}
+}
+
+// ObserveStreamDuration records one full-stream-lifecycle observation.
+// One per ChatStream call. Same outcome vocabulary as
+// ObserveFirstTokenLatency, with the addition of
+// StreamOutcomeMidStreamError for streams that emitted a terminal
+// Err chunk after producing some content.
+func (r *PromRecorder) ObserveStreamDuration(vendor, model, outcome string, d time.Duration) {
+	r.streamDuration.WithLabelValues(vendor, model, outcome).Observe(d.Seconds())
 }

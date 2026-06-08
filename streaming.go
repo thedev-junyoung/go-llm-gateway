@@ -8,6 +8,7 @@ import (
 	"github.com/thedev-junyoung/thedev-junyoung-go-llm-gateway/pkg/metrics"
 	"github.com/thedev-junyoung/thedev-junyoung-go-llm-gateway/pkg/provider"
 	"github.com/thedev-junyoung/thedev-junyoung-go-llm-gateway/pkg/router"
+	"github.com/thedev-junyoung/thedev-junyoung-go-llm-gateway/pkg/tracing"
 )
 
 // ChatStream is the streaming counterpart to Chat. It routes the request
@@ -52,11 +53,28 @@ import (
 func (g *Gateway) ChatStream(ctx context.Context, req provider.ChatRequest) (<-chan provider.StreamChunk, error) {
 	model := normalizeModel(req.Model, g.knownModels)
 
+	// Tracing: open root span for the logical streaming operation.
+	// The span is closed inside the producer goroutine (wrapStream)
+	// when the channel closes — it lives for the full stream lifetime.
+	spanCtx := g.tracing.OnChatStart(ctx, model)
+
+	// streamStarted tracks whether we handed off to the producer goroutine.
+	// If false when we return, the pre-stream failure path closes the span here.
+	var lastErr error
+	streamStarted := false
+	defer func() {
+		if !streamStarted {
+			outcome := "error"
+			if lastErr == nil {
+				outcome = "no_streaming_provider"
+			}
+			g.tracing.OnChatEnd(spanCtx, outcome, lastErr)
+		}
+	}()
+
 	primary, fallbacks, rerr := router.PickWithFallbacks(g.providers, req.Model)
 	if rerr != nil {
-		// Router failure is a pre-stream condition; surface it the same
-		// way Chat does so callers see a consistent error shape across
-		// sync and streaming paths.
+		lastErr = rerr
 		return nil, rerr
 	}
 
@@ -64,15 +82,16 @@ func (g *Gateway) ChatStream(ctx context.Context, req provider.ChatRequest) (<-c
 	candidates = append(candidates, primary)
 	candidates = append(candidates, fallbacks...)
 
-	var lastErr error
-	for _, p := range candidates {
+	for i, p := range candidates {
 		// Caller's ctx is the only time budget — abort early if cancelled
 		// before we even try this candidate.
 		if cerr := ctx.Err(); cerr != nil {
 			if lastErr != nil {
-				return nil, fmt.Errorf("%w: last vendor error: %w", cerr, lastErr)
+				lastErr = fmt.Errorf("%w: last vendor error: %w", cerr, lastErr)
+			} else {
+				lastErr = cerr
 			}
-			return nil, cerr
+			return nil, lastErr
 		}
 
 		sp, ok := p.(provider.StreamingProvider)
@@ -83,11 +102,25 @@ func (g *Gateway) ChatStream(ctx context.Context, req provider.ChatRequest) (<-c
 			continue
 		}
 
+		// Tracing: child span for the pre-stream phase of this attempt.
+		attemptCtx := g.tracing.OnAttemptStart(spanCtx, p.Name(), model, i)
+
 		attemptStart := time.Now()
-		stream, err := sp.ChatStream(ctx, req)
+		stream, err := sp.ChatStream(attemptCtx, req)
 		if err == nil {
-			return wrapStreamWithMetrics(ctx, g.metrics, p.Name(), model, attemptStart, stream), nil
+			g.tracing.OnAttemptEnd(attemptCtx, "success", nil)
+			streamStarted = true
+			return wrapStream(spanCtx, g.metrics, g.tracing, p.Name(), model, attemptStart, stream), nil
 		}
+
+		g.tracing.OnAttemptEnd(attemptCtx, string(provider.OutcomeFromErr(err)), err)
+		g.recordExemplar(attemptCtx, provider.AttemptInfo{
+			Vendor:  p.Name(),
+			Model:   model,
+			AttemptN: i,
+			Outcome: provider.OutcomeFromErr(err),
+			Error:   asProviderError(err),
+		})
 
 		// Pre-stream failure path: ADR-007 Q5 outcome enum reserves
 		// pre_stream_failure for exactly this. Emit so the histogram
@@ -109,18 +142,21 @@ func (g *Gateway) ChatStream(ctx context.Context, req provider.ChatRequest) (<-c
 	// provider supports this model" *ProviderError matching the
 	// router's "no provider supports model" shape.
 	if lastErr == nil {
-		return nil, provider.NewProviderError(gatewayVendorLabel,
+		lastErr = provider.NewProviderError(gatewayVendorLabel,
 			provider.ErrorTypeInvalidInput, 0, false,
 			fmt.Sprintf("no streaming provider supports model %q", req.Model), nil)
 	}
 	return nil, lastErr
 }
 
-// wrapStreamWithMetrics intercepts the chunk stream to emit TTFT and
-// stream_duration observations. Implements the wrapWithMetrics sketch
-// from ADR-007 Synthesis. The wrapper adds one relay goroutine + a
-// per-chunk channel hop; benchmarks pin the per-chunk overhead at
-// nanosecond scale.
+// wrapStream intercepts the chunk stream to emit TTFT / stream_duration
+// metrics (ADR-007) and tracing events (ADR-008). The wrapper adds one relay
+// goroutine + a per-chunk channel hop; the per-chunk overhead is nanosecond
+// scale for the channel forward, plus sub-µs OTel span event additions.
+//
+// spanCtx carries the root span opened by ChatStream; hook.OnChatEnd is
+// called here (not in ChatStream) because the logical end of a streaming
+// operation is when the channel closes, not when ChatStream returns.
 //
 // Outcome label resolution:
 //
@@ -135,39 +171,55 @@ func (g *Gateway) ChatStream(ctx context.Context, req provider.ChatRequest) (<-c
 //     vendor quirk where no error surfaces but no content arrives.
 //   - Mid-stream Err chunk → TTFT already observed Success if any
 //     content reached us; stream_duration=mid_stream_error.
-func wrapStreamWithMetrics(ctx context.Context, rec metrics.MetricRecorder,
-	vendor, model string, attemptStart time.Time,
+func wrapStream(
+	spanCtx context.Context,
+	rec metrics.MetricRecorder,
+	hook tracing.TracingHook,
+	vendor, model string,
+	attemptStart time.Time,
 	in <-chan provider.StreamChunk,
 ) <-chan provider.StreamChunk {
+	// ctx is the original caller context (for ctx.Err() cancellation checks);
+	// spanCtx carries the root span and may differ when tracing is active.
+	ctx := spanCtx
 	out := make(chan provider.StreamChunk, cap(in))
 	go func() {
 		defer close(out)
 		var (
 			firstTokenSeen bool
 			sawErrChunk    bool
+			totalChunks    int
+			midStreamErr   error
 		)
 		for ch := range in {
 			if !firstTokenSeen && ch.ContentDelta != "" {
 				firstTokenSeen = true
+				hook.OnFirstToken(spanCtx)
 				observeFirstTokenLatency(rec, vendor, model,
 					metrics.StreamOutcomeSuccess, time.Since(attemptStart))
 			}
 			if ch.Err != nil {
 				sawErrChunk = true
+				midStreamErr = ch.Err
 			}
+			totalChunks++
 			out <- ch
 		}
 
 		// Channel closed. Resolve outcomes for the not-yet-observed
-		// histograms.
+		// histograms and tracing events.
 		streamOutcome := metrics.StreamOutcomeSuccess
+		failurePhase := ""
 		switch {
 		case sawErrChunk:
 			streamOutcome = metrics.StreamOutcomeMidStreamError
+			failurePhase = "mid_stream"
 		case !firstTokenSeen && ctx.Err() != nil:
 			streamOutcome = metrics.StreamOutcomeCtxCancelBeforeFirstChunk
+			failurePhase = "ctx_cancel"
 		case !firstTokenSeen:
 			streamOutcome = metrics.StreamOutcomePreStreamFailure
+			failurePhase = "mid_stream"
 		}
 		if !firstTokenSeen {
 			ttftOutcome := metrics.StreamOutcomePreStreamFailure
@@ -179,6 +231,16 @@ func wrapStreamWithMetrics(ctx context.Context, rec metrics.MetricRecorder,
 		}
 		observeStreamDuration(rec, vendor, model, streamOutcome,
 			time.Since(attemptStart))
+
+		hook.OnStreamEnd(spanCtx, streamOutcome, totalChunks, failurePhase)
+
+		// Close root span — streaming logical end is channel close, not
+		// ChatStream return (ADR-008 Q3).
+		chatOutcome := "success"
+		if streamOutcome != metrics.StreamOutcomeSuccess {
+			chatOutcome = "error"
+		}
+		hook.OnChatEnd(spanCtx, chatOutcome, midStreamErr)
 	}()
 	return out
 }

@@ -11,6 +11,7 @@ import (
 	"github.com/thedev-junyoung/thedev-junyoung-go-llm-gateway/pkg/provider"
 	"github.com/thedev-junyoung/thedev-junyoung-go-llm-gateway/pkg/ratelimit"
 	"github.com/thedev-junyoung/thedev-junyoung-go-llm-gateway/pkg/router"
+	"github.com/thedev-junyoung/thedev-junyoung-go-llm-gateway/pkg/tracing"
 	"github.com/thedev-junyoung/thedev-junyoung-go-llm-gateway/pkg/types"
 )
 
@@ -63,6 +64,16 @@ type Config struct {
 	// through without configuration. Adopt early, register everything you
 	// care about; don't rely on the default for log-only setups.
 	KnownModels []string
+
+	// Tracing, when non-nil, receives lifecycle events for distributed
+	// tracing (ADR-008). Nil installs tracing.NoOpTracingHook — zero
+	// overhead for callers that don't need OTel spans.
+	//
+	// All hook methods are called synchronously. Do NOT wrap a TracingHook
+	// in metrics.AsyncWrapper — the wrapper's ctx channel breaks span
+	// extraction (ADR-008 Q5). OTel span operations are sub-µs; the
+	// synchronous call cost is negligible.
+	Tracing tracing.TracingHook
 }
 
 // Gateway is the composition root: it owns the providers and dispatches
@@ -73,6 +84,7 @@ type Gateway struct {
 	providers   []provider.Provider
 	rateLimit   ratelimit.RateLimiter  // nil means rate limiting disabled
 	metrics     metrics.MetricRecorder // never nil after New; defaults to NoOp
+	tracing     tracing.TracingHook    // never nil after New; defaults to NoOp
 	knownModels map[string]struct{}    // empty map normalizes all to "unknown" (ADR-006 Q7)
 }
 
@@ -97,6 +109,11 @@ func New(cfg Config) (*Gateway, error) {
 		rec = metrics.NoOpRecorder{}
 	}
 
+	hook := cfg.Tracing
+	if hook == nil {
+		hook = tracing.NoOpTracingHook{}
+	}
+
 	known := make(map[string]struct{}, len(cfg.KnownModels))
 	for _, m := range cfg.KnownModels {
 		known[m] = struct{}{}
@@ -106,6 +123,7 @@ func New(cfg Config) (*Gateway, error) {
 		providers:   cfg.Providers,
 		rateLimit:   cfg.RateLimit,
 		metrics:     rec,
+		tracing:     hook,
 		knownModels: known,
 	}, nil
 }
@@ -126,8 +144,20 @@ func New(cfg Config) (*Gateway, error) {
 // On success, ChatResponse.Attempts mirrors the same records so callers can
 // correlate by request_id without subscribing to the recorder. On error
 // paths Attempts stays empty — the recorder is the canonical sink there.
-func (g *Gateway) Chat(ctx context.Context, req provider.ChatRequest) (provider.ChatResponse, error) {
+func (g *Gateway) Chat(ctx context.Context, req provider.ChatRequest) (resp provider.ChatResponse, err error) {
 	model := normalizeModel(req.Model, g.knownModels)
+
+	// Tracing: open root span. All subsequent hook calls use spanCtx so
+	// attempt child spans nest under the chat span. The defer captures the
+	// named return values so OnChatEnd always sees the final outcome.
+	spanCtx := g.tracing.OnChatStart(ctx, model)
+	defer func() {
+		outcome := "success"
+		if err != nil {
+			outcome = "error"
+		}
+		g.tracing.OnChatEnd(spanCtx, outcome, err)
+	}()
 
 	primary, fallbacks, rerr := router.PickWithFallbacks(g.providers, req.Model)
 	if rerr != nil {
@@ -141,7 +171,8 @@ func (g *Gateway) Chat(ctx context.Context, req provider.ChatRequest) (provider.
 			Origin:  types.OriginGatewayRouter,
 			Error:   asProviderError(rerr),
 		})
-		return provider.ChatResponse{}, rerr
+		err = rerr
+		return provider.ChatResponse{}, err
 	}
 
 	candidates := make([]provider.Provider, 0, 1+len(fallbacks))
@@ -157,9 +188,11 @@ func (g *Gateway) Chat(ctx context.Context, req provider.ChatRequest) (provider.
 		//   errors.Is(err, provider.ErrRateLimited)  // see why we stopped
 		if cerr := ctx.Err(); cerr != nil {
 			if lastErr != nil {
-				return provider.ChatResponse{}, fmt.Errorf("%w: last vendor error: %w", cerr, lastErr)
+				err = fmt.Errorf("%w: last vendor error: %w", cerr, lastErr)
+				return provider.ChatResponse{}, err
 			}
-			return provider.ChatResponse{}, cerr
+			err = cerr
+			return provider.ChatResponse{}, err
 		}
 
 		// Rate-limit pre-check (ADR-005). A denied Allow produces the same
@@ -195,15 +228,23 @@ func (g *Gateway) Chat(ctx context.Context, req provider.ChatRequest) (provider.
 			}
 		}
 
+		// Tracing: child span for this attempt. Use attemptCtx for the
+		// provider call so OTel propagates into the outgoing context.
+		attemptCtx := g.tracing.OnAttemptStart(spanCtx, p.Name(), model, i)
+
 		start := time.Now()
-		resp, cerr := p.Chat(ctx, req)
+		var cerr error
+		resp, cerr = p.Chat(attemptCtx, req)
 		duration := time.Since(start)
+
+		attemptOutcome := provider.OutcomeFromErr(cerr)
+		g.tracing.OnAttemptEnd(attemptCtx, string(attemptOutcome), cerr)
 
 		info := provider.AttemptInfo{
 			Vendor:   p.Name(),
 			Model:    model,
 			AttemptN: i,
-			Outcome:  provider.OutcomeFromErr(cerr),
+			Outcome:  attemptOutcome,
 			Origin:   types.OriginVendor,
 			Duration: duration,
 			Usage:    resp.Usage, // zero on error paths — adapters return zero-Usage there
@@ -211,6 +252,7 @@ func (g *Gateway) Chat(ctx context.Context, req provider.ChatRequest) (provider.
 		}
 		attempts = append(attempts, info)
 		recordAttempt(ctx, g.metrics, info)
+		g.recordExemplar(attemptCtx, info)
 
 		if cerr == nil {
 			if g.rateLimit != nil {
@@ -225,7 +267,8 @@ func (g *Gateway) Chat(ctx context.Context, req provider.ChatRequest) (provider.
 		lastErr = cerr
 
 		if !shouldFailover(cerr) {
-			return provider.ChatResponse{}, cerr
+			err = cerr
+			return provider.ChatResponse{}, err
 		}
 		// shouldFailover already verified *ProviderError; safe to extract.
 		if pe := asProviderError(cerr); pe != nil {
@@ -234,7 +277,8 @@ func (g *Gateway) Chat(ctx context.Context, req provider.ChatRequest) (provider.
 	}
 
 	// Exhausted every supporting provider with retriable failures.
-	return provider.ChatResponse{}, lastErr
+	err = lastErr
+	return provider.ChatResponse{}, err
 }
 
 // emitFailoverIfMore records a FailoverInfo only when a next candidate
@@ -251,6 +295,23 @@ func (g *Gateway) emitFailoverIfMore(ctx context.Context, candidates []provider.
 		ToVendor:   candidates[current+1].Name(),
 		Reason:     reason,
 	})
+}
+
+// recordExemplar bridges OTel trace IDs into Prometheus exemplars (ADR-008 Q6).
+// Both type assertions must succeed; if either fails the call is silently
+// skipped — callers without OTel or without a Prometheus backend are unaffected.
+func (g *Gateway) recordExemplar(ctx context.Context, info provider.AttemptInfo) {
+	te, ok := g.tracing.(tracing.TraceIDExtractor)
+	if !ok {
+		return
+	}
+	er, ok := g.metrics.(metrics.ExemplarRecorder)
+	if !ok {
+		return
+	}
+	if traceID := te.ExtractTraceID(ctx); traceID != "" {
+		er.ObserveAttemptWithExemplar(ctx, info, traceID)
+	}
 }
 
 // shouldFailover reports whether err is a *provider.ProviderError marked

@@ -14,7 +14,7 @@ ADR-006 은 Prometheus metrics + slog structured logging 을 observability 의 �
 1. `MetricRecorder` 인터페이스가 OTel adapter 의 확장점 역할 (ctx 를 hook 시그니처에 포함)
 2. OTel 도입 시 **별 ADR 에서 ctx propagation 룰 재검토** 필요
 
-v0.2 (streaming) 이 main 에 land 된 지금, 세 번째 기둥인 **분산 추적** 의 빈칸을 메울 시점이다.
+두 조건 모두 v0.1 land 시점(ADR-006, PR #75)에 충족됐다. `MetricRecorder.OnAttempt` 와 `OnFailover` 가 모두 `ctx context.Context` 를 첫 인자로 받으며, ctx propagation 룰 재검토가 본 ADR 의 Q4/Q5 에서 이루어진다. v0.2 (streaming, ADR-007) 이 main 에 land 된 지금이 세 번째 기둥인 **분산 추적** 을 결정하는 시점이다.
 
 **왜 tracing 이 필요한가:**
 
@@ -153,8 +153,9 @@ failover 경로는 attempt N이 실패하고 attempt N+1 이 성공하는 복수
       OnFirstToken(ctx context.Context)
 
       // OnStreamEnd is called when the ChatStream producer goroutine
-      // closes the channel.
-      OnStreamEnd(ctx context.Context, outcome string, totalChunks int)
+      // closes the channel. failurePhase is non-empty only on error
+      // outcomes; values: "pre_stream", "mid_stream", "ctx_cancel".
+      OnStreamEnd(ctx context.Context, outcome string, totalChunks int, failurePhase string)
   }
 
   // NoOpTracingHook discards all events. Gateway default when
@@ -169,38 +170,60 @@ failover 경로는 attempt N이 실패하고 attempt N+1 이 성공하는 복수
       return ctx
   }
   func (NoOpTracingHook) OnAttemptEnd(context.Context, string, error)        {}
-  func (NoOpTracingHook) OnFirstToken(context.Context)                       {}
-  func (NoOpTracingHook) OnStreamEnd(context.Context, string, int)           {}
+  func (NoOpTracingHook) OnFirstToken(context.Context)                            {}
+  func (NoOpTracingHook) OnStreamEnd(context.Context, string, int, string)        {}
   ```
 - **Maintainer note:** <!-- TODO: 본인 한 줄 voice 로 -->
 
 ### Q6. Prometheus exemplar — OTel trace ID 연결
 
-- **Decision:** **`pkg/metrics` 에 `ExemplarRecorder` 헬퍼 추가. `MetricRecorder` 인터페이스 변경 없음.**
+- **Decision:** **`pkg/metrics` 에 `ExemplarRecorder` opt-in 인터페이스 추가 + `pkg/tracing` 에 `TraceIDExtractor` opt-in 인터페이스 추가. Gateway 가 두 인터페이스를 type-assert 해 exemplar 를 orchestrate. `pkg/tracing` 과 `pkg/metrics` 사이 직접 의존 없음.**
 - **Agent reasoning:**
-  Prometheus 2.x 는 histogram observation 에 exemplar (trace_id 포함 label 셋) 를 붙일 수 있다. 이를 통해 "p99 spike 시점의 실제 trace" 로 직접 jump 가 가능하다 (Grafana → Tempo 연결). OTel tracing 과 Prometheus metrics 를 연결하는 유일한 standard 방법이다.
+  Prometheus 2.x 는 histogram observation 에 exemplar (trace_id 포함 label 셋) 를 붙일 수 있다. 이를 통해 "p99 spike 시점의 실제 trace" 로 직접 jump 가 가능하다 (Grafana → Tempo 연결).
 
   두 가지 통합 방법:
-  - **A. `MetricRecorder` 인터페이스에 `ObserveWithExemplar` 추가** — BREAKING. v0.2 에 custom MetricRecorder 구현한 사용자가 모두 깨짐.
-  - **B. 별도 opt-in 인터페이스 `ExemplarRecorder`** ✅ — `MetricRecorder` 에 추가 없음. `PromRecorder` 가 `ExemplarRecorder` 도 구현. gateway 가 type assertion 으로 사용 (`if er, ok := g.metrics.(ExemplarRecorder); ok { er.ObserveWithExemplar(...) }`). `StreamingMetricRecorder` 가 Q3 의 선례.
-  ```go
-  // pkg/metrics/exemplar.go
+  - **A. Push-callback (`ExemplarTarget`) 패턴** — `oteltracing.OtelTracingHook` 가 `OnAttemptEnd` 에서 `ExemplarTarget.RecordExemplar(traceID)` 를 call → `PromRecorder` 가 내부에 traceID 를 저장 → 다음 `OnAttempt` 호출 시 첨부. **Reject**: concurrent request 환경에서 Request A 의 `RecordExemplar` 가 Request B 의 `OnAttempt` 직전에 도착하면 traceID 가 교차 오염된다. goroutine ID 는 Go 공개 API 에 없고, ctx 는 immutable 이라 `RecordExemplar` 호출 시점 에 ctx 에 저장 불가. 구조적 data race — 해결할 수 없는 설계 결함.
+  - **B. Gateway orchestration + `TraceIDExtractor`** ✅ — `pkg/tracing` 에 optional 인터페이스 하나 추가:
+    ```go
+    // pkg/tracing/hook.go (추가)
 
-  // ExemplarRecorder is an optional extension of MetricRecorder for
-  // backends that support Prometheus exemplars. Gateway type-asserts;
-  // if the configured recorder does not implement this, exemplars are
-  // silently skipped.
-  type ExemplarRecorder interface {
-      MetricRecorder
-      // ObserveAttemptWithExemplar is like OnAttempt but attaches a
-      // Prometheus exemplar carrying the active OTel trace ID.
-      // traceID must be a 32-char hex string (OTel TraceID.String());
-      // empty string disables exemplar.
-      ObserveAttemptWithExemplar(ctx context.Context, info provider.AttemptInfo, traceID string)
-  }
-  ```
-  - `oteltracing.OtelTracingHook` 가 `OnAttemptEnd` 에서 span 의 `TraceID()` 를 추출해 `ExemplarRecorder.ObserveAttemptWithExemplar` 에 전달 — tracing hook 이 metrics exemplar 의 교량이 된다. 두 시스템의 coupling point 는 최소화.
-- **왜 이 결정이 정당한가:** exemplar 는 opt-in — OTel 없는 사용자는 영향 없음. `PromRecorder` + `OtelTracingHook` 조합에서만 활성화. Grafana → Tempo drilldown 이 즉시 가능해지는 실질적 운영 이득.
+    // TraceIDExtractor is an optional interface for TracingHook
+    // implementations that can surface the active OTel trace ID.
+    // Gateway type-asserts; if the hook does not implement this,
+    // exemplar attachment is silently skipped.
+    type TraceIDExtractor interface {
+        ExtractTraceID(ctx context.Context) string // 32-char hex or ""
+    }
+    ```
+    `OtelTracingHook` 가 구현:
+    ```go
+    func (h *OtelTracingHook) ExtractTraceID(ctx context.Context) string {
+        return trace.SpanFromContext(ctx).SpanContext().TraceID().String()
+    }
+    ```
+    `pkg/metrics` 에 `ExemplarRecorder` opt-in 인터페이스:
+    ```go
+    // pkg/metrics/exemplar.go
+
+    type ExemplarRecorder interface {
+        MetricRecorder
+        ObserveAttemptWithExemplar(ctx context.Context, info provider.AttemptInfo, traceID string)
+    }
+    ```
+    Gateway 가 attempt end 직후 orchestrate:
+    ```go
+    g.tracing.OnAttemptEnd(attemptCtx, outcome, err)
+    // Exemplar bridge: stateless, no shared mutable state.
+    if te, ok := g.tracing.(tracing.TraceIDExtractor); ok {
+        if er, ok := g.metrics.(metrics.ExemplarRecorder); ok {
+            er.ObserveAttemptWithExemplar(attemptCtx, info, te.ExtractTraceID(attemptCtx))
+        }
+    }
+    ```
+    - traceID 추출과 metrics 기록이 같은 goroutine, 같은 시점 — per-request 격리 완전 보장.
+    - `ExemplarTarget` 인터페이스 불필요. `oteltracing` 이 `pkg/metrics` 타입을 알 필요 없음.
+    - `pkg/tracing` 과 `pkg/metrics` 는 상호 독립 유지.
+- **왜 이 결정이 정당한가:** gateway 는 이미 `g.tracing` 과 `g.metrics` 두 필드를 모두 소유하고 있다. 두 optional interface 를 조합하는 orchestrator 역할이 자연스럽다. stateful bridge 없이 race-free. `StreamingMetricRecorder` 의 type-assertion 선례와 일관.
 - **Maintainer note:** <!-- TODO: 본인 한 줄 voice 로 -->
 
 ### Q7. Span attribute cardinality
@@ -223,14 +246,16 @@ failover 경로는 attempt N이 실패하고 attempt N+1 이 성공하는 복수
 pkg/types  (leaf)
     ↑
 pkg/provider  (Provider, StreamingProvider, StreamChunk)
-    ↑
-pkg/metrics  (MetricRecorder, StreamingMetricRecorder, ExemplarRecorder)
-    ↑
-pkg/tracing  (TracingHook, NoOpTracingHook)  ← stdlib only
-    ↑
-pkg/tracing/oteltracing  (OtelTracingHook)  ← otel API-only
-    ↑
-pkg/gateway  (Gateway.Chat, Gateway.ChatStream)
+    ↑                         ↑
+pkg/metrics               pkg/tracing           ← 독립 브랜치, stdlib only
+(MetricRecorder,          (TracingHook,
+ ExemplarRecorder)         NoOpTracingHook,
+                           TraceIDExtractor)
+                               ↑
+                    pkg/tracing/oteltracing     ← otel API-only
+                               ↑
+pkg/gateway  ←────────────────┘
+(imports both pkg/metrics and pkg/tracing; orchestrates exemplar bridge)
 ```
 
 **`pkg/tracing/oteltracing/hook.go` 스케치:**
@@ -258,26 +283,12 @@ const tracerName = "go-llm-gateway"
 //
 // OtelTracingHook is safe for concurrent use.
 type OtelTracingHook struct {
-    tracer         trace.Tracer
-    exemplarTarget ExemplarTarget // optional: populated via WithExemplarTarget
-}
-
-// ExemplarTarget is an optional interface for bridging OTel trace IDs
-// into Prometheus exemplars. If set, OtelTracingHook calls
-// RecordExemplar on attempt end.
-type ExemplarTarget interface {
-    RecordExemplar(traceID string)
+    tracer trace.Tracer
 }
 
 // New returns an OtelTracingHook using the global OTel TracerProvider.
-func New(opts ...Option) *OtelTracingHook {
-    h := &OtelTracingHook{
-        tracer: otel.Tracer(tracerName),
-    }
-    for _, o := range opts {
-        o(h)
-    }
-    return h
+func New() *OtelTracingHook {
+    return &OtelTracingHook{tracer: otel.Tracer(tracerName)}
 }
 
 // Ensure compile-time interface satisfaction.
@@ -322,25 +333,33 @@ func (h *OtelTracingHook) OnAttemptEnd(ctx context.Context, outcome string, err 
     } else {
         span.SetStatus(codes.Ok, "")
     }
-    // Exemplar bridge: notify ExemplarTarget with trace ID so that
-    // PromRecorder can attach it to the histogram observation.
-    if h.exemplarTarget != nil {
-        h.exemplarTarget.RecordExemplar(span.SpanContext().TraceID().String())
-    }
     span.End()
+}
+
+// ExtractTraceID implements tracing.TraceIDExtractor. Gateway calls this
+// after OnAttemptEnd to feed the trace ID into ExemplarRecorder.
+// Returns "" when no active span is found (NoopSpan or unset provider).
+func (h *OtelTracingHook) ExtractTraceID(ctx context.Context) string {
+    sc := trace.SpanFromContext(ctx).SpanContext()
+    if !sc.IsValid() {
+        return ""
+    }
+    return sc.TraceID().String()
 }
 
 func (h *OtelTracingHook) OnFirstToken(ctx context.Context) {
     trace.SpanFromContext(ctx).AddEvent("first_token")
 }
 
-func (h *OtelTracingHook) OnStreamEnd(ctx context.Context, outcome string, totalChunks int) {
-    trace.SpanFromContext(ctx).AddEvent("stream_end",
-        trace.WithAttributes(
-            attribute.String("llm.outcome", outcome),
-            attribute.Int("llm.total_chunks", totalChunks),
-        ),
-    )
+func (h *OtelTracingHook) OnStreamEnd(ctx context.Context, outcome string, totalChunks int, failurePhase string) {
+    attrs := []attribute.KeyValue{
+        attribute.String("llm.outcome", outcome),
+        attribute.Int("llm.total_chunks", totalChunks),
+    }
+    if failurePhase != "" {
+        attrs = append(attrs, attribute.String("llm.failure_phase", failurePhase))
+    }
+    trace.SpanFromContext(ctx).AddEvent("stream_end", trace.WithAttributes(attrs...))
 }
 ```
 
@@ -356,10 +375,19 @@ func (g *Gateway) Chat(ctx context.Context, req provider.ChatRequest) (provider.
 
     // ... existing failover loop ...
     for i, p := range candidates {
-        // tracing: attempt child span
+        // tracing: attempt child span (scoped to runAttempt to avoid ctx confusion)
         attemptCtx := g.tracing.OnAttemptStart(ctx, p.Name(), req.Model, i)
         resp, err := p.Chat(attemptCtx, req)
-        g.tracing.OnAttemptEnd(attemptCtx, outcomeStr(err), err)
+        outcome := outcomeStr(err)
+        g.tracing.OnAttemptEnd(attemptCtx, outcome, err)
+
+        // Exemplar bridge: race-free — same goroutine, after span.End().
+        if te, ok := g.tracing.(tracing.TraceIDExtractor); ok {
+            if er, ok := g.metrics.(metrics.ExemplarRecorder); ok {
+                er.ObserveAttemptWithExemplar(attemptCtx, attemptInfo, te.ExtractTraceID(attemptCtx))
+            }
+        }
+
         if err == nil {
             chatOutcome = "success"
             return resp, nil
@@ -378,16 +406,14 @@ func (g *Gateway) Chat(ctx context.Context, req provider.ChatRequest) (provider.
 
 ### Positive
 
-- Caller 의 기존 OTel span tree 에 gateway 호출이 child 로 붙음 — trace 에 구멍이 없어짐.
-- failover 경로가 span waterfall 로 즉시 가시화 — "어느 vendor 가 얼마를 잡아먹었나" 를 trace UI 에서 직접 확인.
+- **OTel TracerProvider 가 configured 된 환경에서**: caller 의 기존 OTel span tree 에 gateway 호출이 child 로 붙음 — trace 에 구멍이 없어짐. failover 경로가 span waterfall 로 즉시 가시화 — "어느 vendor 가 얼마를 잡아먹었나" 를 trace UI 에서 직접 확인. Prometheus exemplar 연결로 p99 spike → 실제 trace 의 Grafana drilldown 가능.
 - ADR-006 Q6 의 ctx staleness 미해결 문제가 `TracingHook` 분리로 구조적으로 해결됨.
-- Prometheus exemplar 연결로 p99 spike → 실제 trace 의 Grafana drilldown 가능.
-- OTel 안 쓰는 사용자 영향 제로 (`pkg/tracing` 는 zero external deps; `oteltracing` sub-package 는 선택 import).
+- OTel 안 쓰는 사용자 영향 제로 (`pkg/tracing` 는 zero external deps; `oteltracing` sub-package 는 선택 import). `otel.SetTracerProvider` 미설정 시 global `NoopProvider` 로 silent no-op.
 
 ### Negative
 
-- `gateway.Chat` / `gateway.ChatStream` 에 hook 삽입 → hot path 에 함수 호출 2-6개 추가. span Start/End 는 sub-µs 이므로 p99 tail latency 영향 < 1µs (실측으로 확인 필요 — Q5 reasoning 참고).
-- `TracingHook` 인터페이스가 `OnAttemptStart` / `OnAttemptEnd` 가 ctx 를 반환 — 기존 `MetricRecorder.OnAttempt(ctx, info)` 의 단방향 흐름과 다름. gateway 내부 `attemptCtx` 변수 관리 필요.
+- `gateway.Chat` / `gateway.ChatStream` 에 hook 삽입 → hot path 에 함수 호출 2-6개 추가. 실 SDK `TracerProvider` 에서 `span.Start()` 는 heap alloc (~200B) + `time.Now()` 2회 + goroutine-safe ID 생성을 포함해 1–10 µs 범위. failover 3 attempt 조합 시 30–60 µs 추가 가능. `NoopProvider` 기준 sub-µs 주장은 기준이 다름 — 실측 benchmark 필요 (Open Questions 참고).
+- `TracingHook` 인터페이스가 `OnAttemptStart` 가 ctx 를 반환 — 기존 `MetricRecorder.OnAttempt(ctx, info)` 의 단방향 흐름과 다름. gateway 내부 `attemptCtx` 변수 관리 필요 (`OnAttemptEnd` 는 ctx 반환 없음).
 - `pkg/tracing/oteltracing` 의 OTel API 버전이 caller 의 OTel SDK 버전과 충돌 가능 (`go.sum` diamond dependency). ADR-002 의 "minimal external" 우려가 sub-package 로 격리돼 코어엔 영향 없으나, `oteltracing` 사용자는 버전 pin 이 필요할 수 있음.
 
 ### Risks
@@ -398,7 +424,7 @@ func (g *Gateway) Chat(ctx context.Context, req provider.ChatRequest) (provider.
 | `OnAttemptStart` 가 반환하는 `attemptCtx` 가 root ctx 에 span 두 개 (root + attempt) 를 중첩 — `trace.SpanFromContext` 가 항상 deepest span 반환하므로 의도대로 동작. 그러나 `OnAttemptEnd` 에서 `attemptCtx` 가 아닌 `ctx` 를 잘못 넘기면 root span 이 attempt span 처럼 end 됨 | gateway 구현 시 `attemptCtx` 와 `ctx` 혼동 방지를 위해 attempt loop 를 별 함수로 추출 (`runAttempt(ctx, ...) context.Context`) — ctx scoping 이 함수 경계로 명확해짐. |
 | `oteltracing` sub-package 의 OTel API minor version 이 caller 의 SDK 와 misalign | `go.mod` 에 `go.opentelemetry.io/otel` version 을 latest stable 로 pin. OTel API 는 semver-stable 이므로 minor bump 에서 API 파괴 없음. major bump (v2) 는 별 ADR. |
 | streaming 에서 `OnChatEnd` 가 producer goroutine 종료 시점에 호출 — root span 수명이 `ChatStream` 호출 반환 시점이 아닌 stream 전체 수명과 같음. span 이 수십 초 open 상태 가능 | 의도된 동작. span 은 "logical operation" 의 수명을 따라야 함. streaming 의 논리적 끝은 stream close. 단 trace backend 가 open span timeout 설정이 있으면 조기 종료 가능 — `oteltracing` godoc 에 "streaming span may last O(seconds)-O(minutes)" 명시. |
-| Exemplar bridge (`ExemplarTarget`) 가 race 없이 trace ID 를 PromRecorder 에 전달해야 함 | `OtelTracingHook.OnAttemptEnd` → `ExemplarTarget.RecordExemplar` 호출은 동기. PromRecorder 가 `RecordExemplar` 를 받아 다음 `OnAttempt` 호출 시 첨부 (per-goroutine store 또는 ctx 값). 구현 시 race detector 로 확인. |
+| Exemplar bridge 에서 traceID 추출 시점에 span 이 이미 ended — `ExtractTraceID` 가 `OnAttemptEnd` 이후 호출되므로 span.End() 직후임. OTel SDK 에서 ended span 의 `SpanContext()` 는 여전히 유효 (`TraceID`, `SpanID` 는 immutable) — 이 호출은 안전. | OTel spec 에서 `SpanContext` 는 span 의 lifecycle 과 무관하게 read-only 접근 보장. 구현 시 `sc.IsValid()` check (`ExtractTraceID` 에 이미 포함) 로 noop span 방어. |
 
 ---
 
@@ -422,6 +448,12 @@ OTel API 는 ~300KB 로 가볍다. 코어에 넣으면 사용자가 별 import �
 
 **Reject 이유:** 별도 Q 가 필요한 ADR 범위 확장. ADR-006 Q1 이 이미 "Recorder 인터페이스 + OTel adapter 별 모듈" 을 future-proof 로 남겼다. 그 결정은 유효하고 이 ADR 의 `TracingHook` 분리 패턴으로도 동일한 extensibility 가 보장된다. OTel metrics bridge 는 후속 ADR (v0.3 후보) 에서.
 
+### Alt 5 — Q6 ExemplarTarget push-callback (채택 후 폐기)
+
+최초 설계에서 `oteltracing.ExemplarTarget` 인터페이스를 정의하고, `OtelTracingHook.OnAttemptEnd` 가 `ExemplarTarget.RecordExemplar(traceID)` 를 호출 → `PromRecorder` 가 내부 상태에 traceID 저장 → 다음 `OnAttempt` 호출 시 첨부 하는 push-callback 패턴을 검토했다.
+
+**Reject 이유:** concurrent request 환경에서 Request A 의 `RecordExemplar` 가 Request B 의 `OnAttempt` 사이에 도착하면 traceID 가 교차 오염된다. goroutine ID 는 Go 공개 API 에 없고, ctx 는 immutable 이라 RecordExemplar 호출 시 ctx 에 저장 불가 — per-request 격리 구현이 근본적으로 불가능하다. `TraceIDExtractor` + gateway orchestration 이 stateful bridge 자체를 제거해 race 문제를 구조로 해소한다.
+
 ### Alt 4 — Q5 ctx-preserving AsyncWrapper
 
 channel 에 `(ctx, event)` 쌍을 enqueue 하되 ctx 를 WithoutCancel 로 복사해 staleness 방지.
@@ -441,6 +473,7 @@ channel 에 `(ctx, event)` 쌍을 enqueue 하되 ctx 를 WithoutCancel 로 복�
 
 - [ ] **OTel LLM semantic conventions** (`gen_ai.*`) 이 stable 확정 시 `llm.*` attribute prefix rename — 별 ADR 또는 minor PR. 현재 OTel semconv 는 draft 상태 (2026-06 기준).
 - [ ] **`oteltracing` 의 별 Go module 분리** — v0.3 에서 release cadence 가 코어와 분리될 필요가 생기면 별 module (`go-llm-gateway/oteltracing v0.x`). 현재 sub-package 로 충분.
+- [ ] **span Start/End benchmark** — 실 SDK `TracerProvider` (OTLP exporter) 환경에서 `gateway.Chat` p99 tail latency 오버헤드 측정 필요. `go test -bench=BenchmarkGatewayChat -benchtime=5s` + `NoopProvider` vs `SDKProvider` 비교. 구현 PR 에서 측정 후 README 에 수치 인용. 현재 Negative 항목의 "1–10 µs" 추정치는 실측 전까지 잠정치.
 - [ ] **Metrics bridge ADR** — `oteltracing.MetricRecorder` (OTel metrics API 구현) 설계. 본 ADR 의 후속.
 - [ ] **Logs bridge ADR** — ADR-006 Q6 Alt 8 의 OTel Logs adapter. 본 ADR 의 후속.
 - [ ] **streaming span 수명 경고 임계치** — root span 이 수십 분 open 이면 trace backend 가 GC 로 purge. 구현 시 span events 의 timestamp 으로 대체 가능한지 검토.

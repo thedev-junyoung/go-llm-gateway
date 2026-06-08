@@ -53,7 +53,9 @@ type TracingHook interface { //nolint:revive // TracingHook follows project nami
 
 	// OnStreamEnd is called when the ChatStream producer goroutine closes
 	// the channel. failurePhase is non-empty only on error outcomes:
-	// "mid_stream" or "ctx_cancel"; empty on normal success.
+	// "mid_stream" (Err chunk received), "ctx_cancel" (caller cancelled),
+	// "pre_stream" (stream closed with no content and no error chunk);
+	// empty string on normal success.
 	OnStreamEnd(ctx context.Context, outcome string, totalChunks int, failurePhase string)
 }
 

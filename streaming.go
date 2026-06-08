@@ -119,6 +119,7 @@ func (g *Gateway) ChatStream(ctx context.Context, req provider.ChatRequest) (<-c
 			Model:    model,
 			AttemptN: i,
 			Outcome:  provider.OutcomeFromErr(err),
+			Duration: time.Since(attemptStart),
 			Error:    asProviderError(err),
 		})
 
@@ -179,9 +180,6 @@ func wrapStream(
 	attemptStart time.Time,
 	in <-chan provider.StreamChunk,
 ) <-chan provider.StreamChunk {
-	// ctx is the original caller context (for ctx.Err() cancellation checks);
-	// spanCtx carries the root span and may differ when tracing is active.
-	ctx := spanCtx
 	out := make(chan provider.StreamChunk, cap(in))
 	go func() {
 		defer close(out)
@@ -214,16 +212,19 @@ func wrapStream(
 		case sawErrChunk:
 			streamOutcome = metrics.StreamOutcomeMidStreamError
 			failurePhase = "mid_stream"
-		case !firstTokenSeen && ctx.Err() != nil:
+		case !firstTokenSeen && spanCtx.Err() != nil:
 			streamOutcome = metrics.StreamOutcomeCtxCancelBeforeFirstChunk
 			failurePhase = "ctx_cancel"
 		case !firstTokenSeen:
+			// Vendor closed the stream without any content delta and without
+			// an Err chunk — covers the "200 with empty stream" quirk.
+			// This is a pre-stream-equivalent failure, not mid-stream.
 			streamOutcome = metrics.StreamOutcomePreStreamFailure
-			failurePhase = "mid_stream"
+			failurePhase = "pre_stream"
 		}
 		if !firstTokenSeen {
 			ttftOutcome := metrics.StreamOutcomePreStreamFailure
-			if ctx.Err() != nil {
+			if spanCtx.Err() != nil {
 				ttftOutcome = metrics.StreamOutcomeCtxCancelBeforeFirstChunk
 			}
 			observeFirstTokenLatency(rec, vendor, model, ttftOutcome,

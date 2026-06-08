@@ -26,7 +26,7 @@ import "context"
 //
 // OnFirstToken and OnStreamEnd are ChatStream-only; they are no-ops on
 // the sync Chat path.
-type TracingHook interface {
+type TracingHook interface { //nolint:revive // TracingHook follows project naming convention (cf. metrics.MetricRecorder)
 	// OnChatStart is called at the entry of gateway.Chat or
 	// gateway.ChatStream, before the router runs. Returns a context
 	// carrying the root span; all subsequent hook calls receive this ctx.
@@ -72,14 +72,25 @@ type TraceIDExtractor interface {
 // tracing pay zero overhead beyond a nil check in New.
 type NoOpTracingHook struct{}
 
+// OnChatStart returns ctx unchanged.
 func (NoOpTracingHook) OnChatStart(ctx context.Context, _ string) context.Context { return ctx }
-func (NoOpTracingHook) OnChatEnd(context.Context, string, error)                   {}
+
+// OnChatEnd does nothing.
+func (NoOpTracingHook) OnChatEnd(context.Context, string, error) {}
+
+// OnAttemptStart returns ctx unchanged.
 func (NoOpTracingHook) OnAttemptStart(ctx context.Context, _, _ string, _ int) context.Context {
 	return ctx
 }
-func (NoOpTracingHook) OnAttemptEnd(context.Context, string, error)        {}
-func (NoOpTracingHook) OnFirstToken(context.Context)                       {}
-func (NoOpTracingHook) OnStreamEnd(context.Context, string, int, string)   {}
+
+// OnAttemptEnd does nothing.
+func (NoOpTracingHook) OnAttemptEnd(context.Context, string, error) {}
+
+// OnFirstToken does nothing.
+func (NoOpTracingHook) OnFirstToken(context.Context) {}
+
+// OnStreamEnd does nothing.
+func (NoOpTracingHook) OnStreamEnd(context.Context, string, int, string) {}
 
 // compile-time interface check
 var _ TracingHook = NoOpTracingHook{}

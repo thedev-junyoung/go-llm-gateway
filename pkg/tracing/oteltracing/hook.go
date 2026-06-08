@@ -42,7 +42,7 @@ const tracerName = "go-llm-gateway"
 // OnChatEnd, which the gateway calls from inside the ChatStream producer
 // goroutine — the span may therefore remain open for O(seconds) to
 // O(minutes). Configure your trace backend's open-span TTL accordingly.
-type OtelTracingHook struct {
+type OtelTracingHook struct { //nolint:revive // OtelTracingHook follows project naming convention
 	tracer trace.Tracer
 }
 

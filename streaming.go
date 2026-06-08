@@ -115,11 +115,11 @@ func (g *Gateway) ChatStream(ctx context.Context, req provider.ChatRequest) (<-c
 
 		g.tracing.OnAttemptEnd(attemptCtx, string(provider.OutcomeFromErr(err)), err)
 		g.recordExemplar(attemptCtx, provider.AttemptInfo{
-			Vendor:  p.Name(),
-			Model:   model,
+			Vendor:   p.Name(),
+			Model:    model,
 			AttemptN: i,
-			Outcome: provider.OutcomeFromErr(err),
-			Error:   asProviderError(err),
+			Outcome:  provider.OutcomeFromErr(err),
+			Error:    asProviderError(err),
 		})
 
 		// Pre-stream failure path: ADR-007 Q5 outcome enum reserves

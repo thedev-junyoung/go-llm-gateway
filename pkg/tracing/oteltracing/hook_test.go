@@ -19,7 +19,7 @@ func newTestHook() (*oteltracing.OtelTracingHook, *tracetest.SpanRecorder) {
 	return oteltracing.NewWithTracer(tp.Tracer("test")), sr
 }
 
-func TestOtelTracingHook_ImplementsInterfaces(t *testing.T) {
+func TestOtelTracingHook_ImplementsInterfaces(_ *testing.T) {
 	var _ tracing.TracingHook = oteltracing.New()
 	var _ tracing.TraceIDExtractor = oteltracing.New()
 }

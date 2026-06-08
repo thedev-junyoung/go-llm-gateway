@@ -84,7 +84,7 @@ type Gateway struct {
 	providers   []provider.Provider
 	rateLimit   ratelimit.RateLimiter  // nil means rate limiting disabled
 	metrics     metrics.MetricRecorder // never nil after New; defaults to NoOp
-	tracing     tracing.TracingHook   // never nil after New; defaults to NoOp
+	tracing     tracing.TracingHook    // never nil after New; defaults to NoOp
 	knownModels map[string]struct{}    // empty map normalizes all to "unknown" (ADR-006 Q7)
 }
 

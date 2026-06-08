@@ -19,7 +19,7 @@ func TestNoOpTracingHook_ReturnsCtxUnchanged(t *testing.T) {
 	}
 }
 
-func TestNoOpTracingHook_DoesNotPanic(t *testing.T) {
+func TestNoOpTracingHook_DoesNotPanic(_ *testing.T) {
 	hook := tracing.NoOpTracingHook{}
 	ctx := context.Background()
 
